@@ -1,0 +1,151 @@
+diff --git a/Sources/NearbySyncCore/SyncStore.swift b/Sources/NearbySyncCore/SyncStore.swift
+index 19eb495..bd066a3 100644
+--- a/Sources/NearbySyncCore/SyncStore.swift
++++ b/Sources/NearbySyncCore/SyncStore.swift
+@@ -50,6 +50,7 @@ public actor LocalFirstTextSyncStore: SyncStore {
+     private let localDeviceID: String
+     private let conflictStore: SyncTextConflictStore
+     private var records: [RecordKey: SyncRecord] = [:]
++    private var remoteBaselines: [RecordKey: SyncRecord] = [:]
+ 
+     public init(
+         localDeviceID: String,
+@@ -74,21 +75,23 @@ public actor LocalFirstTextSyncStore: SyncStore {
+             return false
+         }
+ 
+-        // Remote text changes are local-first: never replace or delete existing local text here.
+-        // Preserve divergent remote text for review so the UI can offer copy/restore later.
+         if change.originDeviceID != localDeviceID,
+            let existing = records[key],
+            preserveConflictIfNeeded(existing: existing, change: change) {
+             return false
+         }
+ 
+-        records[key] = SyncRecord(
++        let record = SyncRecord(
+             entityType: change.entityType,
+             entityID: change.entityID,
+             payload: change.payload,
+             updatedAt: change.updatedAt,
+             isDeleted: change.operation == .delete
+         )
++        records[key] = record
++        if change.originDeviceID != localDeviceID {
++            remoteBaselines[key] = record
++        }
+         return true
+     }
+ 
+@@ -118,10 +121,24 @@ public actor LocalFirstTextSyncStore: SyncStore {
+             updatedAt: Date(),
+             isDeleted: false
+         )
++        remoteBaselines[key] = SyncRecord(
++            entityType: conflict.entityType,
++            entityID: conflict.entityID,
++            payload: Data(conflict.remoteText.utf8),
++            updatedAt: conflict.remoteUpdatedAt,
++            isDeleted: false
++        )
+         return conflictStore.removeConflict(id: conflict.id)
+     }
+ 
+     private func preserveConflictIfNeeded(existing: SyncRecord, change: SyncChange) -> Bool {
++        let key = RecordKey(type: change.entityType, id: change.entityID)
++        if let remoteBaseline = remoteBaselines[key],
++           existing.payload == remoteBaseline.payload,
++           existing.isDeleted == remoteBaseline.isDeleted {
++            return false
++        }
++
+         let localText = String(data: existing.payload, encoding: .utf8) ?? ""
+         let remoteText = String(data: change.payload, encoding: .utf8) ?? ""
+ 
+diff --git a/Tests/NearbySyncCoreTests/NearbySyncCoreTests.swift b/Tests/NearbySyncCoreTests/NearbySyncCoreTests.swift
+index 6578711..f440a77 100644
+--- a/Tests/NearbySyncCoreTests/NearbySyncCoreTests.swift
++++ b/Tests/NearbySyncCoreTests/NearbySyncCoreTests.swift
+@@ -124,17 +124,26 @@ final class NearbySyncCoreTests: XCTestCase {
+         let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+         let store = LocalFirstTextSyncStore(
+             localDeviceID: "device-a",
+-            conflictStore: conflictStore,
+-            seedRecords: [
+-                SyncRecord(
+-                    entityType: .item,
+-                    entityID: "item-1",
+-                    payload: Data("local".utf8),
+-                    updatedAt: Date(timeIntervalSince1970: 100)
+-                )
+-            ]
++            conflictStore: conflictStore
+         )
+         let engine = SyncEngine(deviceID: "device-a", store: store)
++        let originalRemoteChange = SyncChange(
++            entityType: .item,
++            entityID: "item-1",
++            operation: .upsert,
++            payload: Data("original".utf8),
++            updatedAt: Date(timeIntervalSince1970: 100),
++            originDeviceID: "device-b"
++        )
++        _ = await engine.applyIncomingEnvelope(
++            SyncEnvelope(senderDeviceID: "device-b", changes: [originalRemoteChange])
++        )
++        _ = await engine.recordLocalChange(
++            entityType: .item,
++            entityID: "item-1",
++            payload: Data("local".utf8),
++            updatedAt: Date(timeIntervalSince1970: 150)
++        )
+         let change = SyncChange(
+             entityType: .item,
+             entityID: "item-1",
+@@ -153,4 +162,46 @@ final class NearbySyncCoreTests: XCTestCase {
+         XCTAssertEqual(conflicts.first?.localText, "local")
+         XCTAssertEqual(conflicts.first?.remoteText, "remote")
+     }
++
++    func testLocalFirstTextStoreAppliesRemoteTextWhenLocalMatchesRemoteBaseline() async {
++        let conflictURL = FileManager.default.temporaryDirectory
++            .appendingPathComponent(UUID().uuidString, isDirectory: true)
++            .appendingPathComponent("sync-conflicts.json")
++        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
++        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
++        let store = LocalFirstTextSyncStore(
++            localDeviceID: "device-a",
++            conflictStore: conflictStore
++        )
++        let engine = SyncEngine(deviceID: "device-a", store: store)
++        let originalRemoteChange = SyncChange(
++            entityType: .item,
++            entityID: "item-1",
++            operation: .upsert,
++            payload: Data("original".utf8),
++            updatedAt: Date(timeIntervalSince1970: 100),
++            originDeviceID: "device-b"
++        )
++        let newerRemoteChange = SyncChange(
++            entityType: .item,
++            entityID: "item-1",
++            operation: .upsert,
++            payload: Data("remote".utf8),
++            updatedAt: Date(timeIntervalSince1970: 200),
++            originDeviceID: "device-b"
++        )
++
++        _ = await engine.applyIncomingEnvelope(
++            SyncEnvelope(senderDeviceID: "device-b", changes: [originalRemoteChange])
++        )
++        let result = await engine.applyIncomingEnvelope(
++            SyncEnvelope(senderDeviceID: "device-b", changes: [newerRemoteChange])
++        )
++
++        let record = await store.record(for: .item, entityID: "item-1")
++        let conflicts = await store.activeConflicts(now: Date(timeIntervalSince1970: 201))
++        XCTAssertEqual(record?.payload, Data("remote".utf8))
++        XCTAssertEqual(result.appliedChangeIDs, [newerRemoteChange.id])
++        XCTAssertTrue(conflicts.isEmpty)
++    }
+ }

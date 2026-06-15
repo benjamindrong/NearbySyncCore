@@ -50,6 +50,7 @@ public actor LocalFirstTextSyncStore: SyncStore {
     private let localDeviceID: String
     private let conflictStore: SyncTextConflictStore
     private var records: [RecordKey: SyncRecord] = [:]
+    private var remoteBaselines: [RecordKey: SyncRecord] = [:]
 
     public init(
         localDeviceID: String,
@@ -74,21 +75,23 @@ public actor LocalFirstTextSyncStore: SyncStore {
             return false
         }
 
-        // Remote text changes are local-first: never replace or delete existing local text here.
-        // Preserve divergent remote text for review so the UI can offer copy/restore later.
         if change.originDeviceID != localDeviceID,
            let existing = records[key],
            preserveConflictIfNeeded(existing: existing, change: change) {
             return false
         }
 
-        records[key] = SyncRecord(
+        let record = SyncRecord(
             entityType: change.entityType,
             entityID: change.entityID,
             payload: change.payload,
             updatedAt: change.updatedAt,
             isDeleted: change.operation == .delete
         )
+        records[key] = record
+        if change.originDeviceID != localDeviceID {
+            remoteBaselines[key] = record
+        }
         return true
     }
 
@@ -118,10 +121,24 @@ public actor LocalFirstTextSyncStore: SyncStore {
             updatedAt: Date(),
             isDeleted: false
         )
+        remoteBaselines[key] = SyncRecord(
+            entityType: conflict.entityType,
+            entityID: conflict.entityID,
+            payload: Data(conflict.remoteText.utf8),
+            updatedAt: conflict.remoteUpdatedAt,
+            isDeleted: false
+        )
         return conflictStore.removeConflict(id: conflict.id)
     }
 
     private func preserveConflictIfNeeded(existing: SyncRecord, change: SyncChange) -> Bool {
+        let key = RecordKey(type: change.entityType, id: change.entityID)
+        if let remoteBaseline = remoteBaselines[key],
+           existing.payload == remoteBaseline.payload,
+           existing.isDeleted == remoteBaseline.isDeleted {
+            return false
+        }
+
         let localText = String(data: existing.payload, encoding: .utf8) ?? ""
         let remoteText = String(data: change.payload, encoding: .utf8) ?? ""
 
