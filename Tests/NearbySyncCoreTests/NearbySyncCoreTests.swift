@@ -22,7 +22,7 @@ final class NearbySyncCoreTests: XCTestCase {
         XCTAssertEqual(envelope?.changes, [change])
     }
 
-    func testAcknowledgedEnvelopeClearsQueue() async {
+    func testAcknowledgedEnvelopeClearsQueue() async throws {
         let store = InMemorySyncStore()
         let engine = SyncEngine(deviceID: "device-a", store: store)
 
@@ -35,7 +35,7 @@ final class NearbySyncCoreTests: XCTestCase {
         let envelope = await engine.nextEnvelope()
         XCTAssertEqual(await engine.pendingChangeCount(), 1)
 
-        await engine.acknowledgeChanges(XCTUnwrap(envelope).changes.map(\.id))
+        await engine.acknowledgeChanges(try XCTUnwrap(envelope).changes.map(\.id))
 
         XCTAssertEqual(await engine.pendingChangeCount(), 0)
     }
@@ -73,6 +73,77 @@ final class NearbySyncCoreTests: XCTestCase {
 
         XCTAssertEqual(firstResult.appliedChangeIDs, [change.id])
         XCTAssertEqual(secondResult.ignoredDuplicateIDs, [change.id])
+    }
+
+    func testDuplicateIncomingChangeIsRememberedAcrossRestart() async {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-queue.json")
+        defer { try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent()) }
+        let change = SyncChange(
+            entityType: .marker,
+            entityID: "pin-1",
+            operation: .upsert,
+            payload: Data("Marker".utf8),
+            updatedAt: Date(timeIntervalSince1970: 200),
+            originDeviceID: "device-a"
+        )
+        let firstEngine = SyncEngine(
+            deviceID: "device-b",
+            store: InMemorySyncStore(),
+            queue: SyncQueue(persistence: FileBackedSyncQueuePersistence(fileURL: fileURL))
+        )
+
+        _ = await firstEngine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-a", changes: [change]))
+
+        let restartedEngine = SyncEngine(
+            deviceID: "device-b",
+            store: InMemorySyncStore(),
+            queue: SyncQueue(persistence: FileBackedSyncQueuePersistence(fileURL: fileURL))
+        )
+        let replayResult = await restartedEngine.applyIncomingEnvelope(
+            SyncEnvelope(senderDeviceID: "device-a", changes: [change])
+        )
+
+        XCTAssertEqual(replayResult.ignoredDuplicateIDs, [change.id])
+    }
+
+    func testIncomingChangeIsNotRequeuedAsLocalChange() async {
+        let store = InMemorySyncStore()
+        let engine = SyncEngine(deviceID: "device-b", store: store)
+        let change = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: Data("remote".utf8),
+            updatedAt: Date(timeIntervalSince1970: 200),
+            originDeviceID: "device-a"
+        )
+
+        _ = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-a", changes: [change]))
+
+        let envelope = await engine.nextEnvelope()
+        XCTAssertEqual(envelope?.changes, [])
+        XCTAssertEqual(envelope?.acknowledgedChangeIDs, [change.id])
+    }
+
+    func testAcknowledgementEnvelopeClearsSenderQueue() async throws {
+        let sender = SyncEngine(deviceID: "device-a", store: InMemorySyncStore())
+        let receiver = SyncEngine(deviceID: "device-b", store: InMemorySyncStore())
+        let change = await sender.recordLocalChange(
+            entityType: .item,
+            entityID: "item-1",
+            payload: Data("one".utf8),
+            updatedAt: Date(timeIntervalSince1970: 100)
+        )
+        let outbound = await sender.nextEnvelope()
+        _ = await receiver.applyIncomingEnvelope(try XCTUnwrap(outbound))
+        let acknowledgement = await receiver.nextEnvelope()
+
+        _ = await sender.applyIncomingEnvelope(try XCTUnwrap(acknowledgement))
+
+        XCTAssertEqual(await sender.pendingChangeCount(), 0)
+        XCTAssertEqual(acknowledgement?.acknowledgedChangeIDs, [change.id])
     }
 
     func testNewestUpdatedAtWinsConflict() async {
@@ -203,5 +274,39 @@ final class NearbySyncCoreTests: XCTestCase {
         XCTAssertEqual(record?.payload, Data("remote".utf8))
         XCTAssertEqual(result.appliedChangeIDs, [newerRemoteChange.id])
         XCTAssertTrue(conflicts.isEmpty)
+    }
+
+    func testLocalFirstConflictResolutionActionsDoNotQueueChanges() async {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let store = LocalFirstTextSyncStore(localDeviceID: "device-a", conflictStore: conflictStore)
+        let engine = SyncEngine(deviceID: "device-a", store: store)
+        let conflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "local",
+            remoteText: "remote",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            expiresAt: Date(timeIntervalSince1970: 1_000)
+        )
+        _ = conflictStore.preserve(conflict)
+
+        _ = await store.restore(conflict)
+
+        let envelope = await engine.nextEnvelope()
+        XCTAssertEqual(await engine.pendingChangeCount(), 0)
+        XCTAssertNil(envelope)
+    }
+
+    func testQueuePersistenceFailureIsReported() {
+        let result = FileBackedSyncQueuePersistence(fileURL: URL(fileURLWithPath: "/dev/null/queue.json"))
+            .saveSnapshot(SyncQueueSnapshot())
+
+        XCTAssertFalse(result.didPersist)
+        XCTAssertNotNil(result.errorDescription)
     }
 }

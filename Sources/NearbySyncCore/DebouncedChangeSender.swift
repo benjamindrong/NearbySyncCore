@@ -1,6 +1,6 @@
 import Foundation
 
-public final class DebouncedChangeSender: @unchecked Sendable {
+public actor DebouncedChangeSender {
     private let delay: Duration
     private var task: Task<Void, Never>?
     private let send: @Sendable () async -> Void

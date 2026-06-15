@@ -3,11 +3,15 @@ import Foundation
 public actor SyncQueue {
     private var pendingChanges: [SyncChange] = []
     private var appliedChangeIDs: Set<UUID> = []
+    private var pendingAcknowledgementIDs: Set<UUID> = []
     private let persistence: SyncQueuePersistence?
 
     public init(persistence: SyncQueuePersistence? = nil) {
         self.persistence = persistence
-        pendingChanges = persistence?.loadPendingChanges() ?? []
+        let snapshot = persistence?.loadSnapshot() ?? SyncQueueSnapshot()
+        pendingChanges = snapshot.pendingChanges
+        appliedChangeIDs = Set(snapshot.appliedChangeIDs)
+        pendingAcknowledgementIDs = Set(snapshot.pendingAcknowledgementIDs)
     }
 
     public func enqueue(_ change: SyncChange) {
@@ -30,9 +34,14 @@ public actor SyncQueue {
         Array(pendingChanges.prefix(limit))
     }
 
+    public func acknowledgementBatch(limit: Int = 100) -> [UUID] {
+        Array(pendingAcknowledgementIDs.prefix(limit))
+    }
+
     public func markAcknowledged(_ acknowledgedChangeIDs: [UUID]) {
         let acknowledgedIDs = Set(acknowledgedChangeIDs)
         pendingChanges.removeAll { acknowledgedIDs.contains($0.id) }
+        pendingAcknowledgementIDs.subtract(acknowledgedIDs)
         persistPendingChanges()
     }
 
@@ -42,6 +51,13 @@ public actor SyncQueue {
 
     public func markApplied(_ changeID: UUID) {
         appliedChangeIDs.insert(changeID)
+        pendingAcknowledgementIDs.insert(changeID)
+        persistPendingChanges()
+    }
+
+    public func markAcknowledgementSent(_ changeIDs: [UUID]) {
+        pendingAcknowledgementIDs.subtract(changeIDs)
+        persistPendingChanges()
     }
 
     public func pendingCount() -> Int {
@@ -49,13 +65,35 @@ public actor SyncQueue {
     }
 
     private func persistPendingChanges() {
-        persistence?.savePendingChanges(pendingChanges)
+        _ = persistence?.saveSnapshot(
+            SyncQueueSnapshot(
+                pendingChanges: pendingChanges,
+                appliedChangeIDs: Array(appliedChangeIDs),
+                pendingAcknowledgementIDs: Array(pendingAcknowledgementIDs)
+            )
+        )
     }
 }
 
 public protocol SyncQueuePersistence: Sendable {
-    func loadPendingChanges() -> [SyncChange]
-    func savePendingChanges(_ changes: [SyncChange])
+    func loadSnapshot() -> SyncQueueSnapshot
+    func saveSnapshot(_ snapshot: SyncQueueSnapshot) -> SyncPersistenceResult
+}
+
+public struct SyncQueueSnapshot: Codable, Equatable, Sendable {
+    public var pendingChanges: [SyncChange]
+    public var appliedChangeIDs: [UUID]
+    public var pendingAcknowledgementIDs: [UUID]
+
+    public init(
+        pendingChanges: [SyncChange] = [],
+        appliedChangeIDs: [UUID] = [],
+        pendingAcknowledgementIDs: [UUID] = []
+    ) {
+        self.pendingChanges = pendingChanges
+        self.appliedChangeIDs = appliedChangeIDs
+        self.pendingAcknowledgementIDs = pendingAcknowledgementIDs
+    }
 }
 
 public final class FileBackedSyncQueuePersistence: SyncQueuePersistence, @unchecked Sendable {
@@ -67,22 +105,29 @@ public final class FileBackedSyncQueuePersistence: SyncQueuePersistence, @unchec
         self.fileURL = fileURL
     }
 
-    public func loadPendingChanges() -> [SyncChange] {
-        guard let data = try? Data(contentsOf: fileURL) else { return [] }
-        return (try? decoder.decode([SyncChange].self, from: data)) ?? []
+    public func loadSnapshot() -> SyncQueueSnapshot {
+        guard let data = try? Data(contentsOf: fileURL) else { return SyncQueueSnapshot() }
+        if let snapshot = try? decoder.decode(SyncQueueSnapshot.self, from: data) {
+            return snapshot
+        }
+        if let legacyChanges = try? decoder.decode([SyncChange].self, from: data) {
+            return SyncQueueSnapshot(pendingChanges: legacyChanges)
+        }
+        return SyncQueueSnapshot()
     }
 
-    public func savePendingChanges(_ changes: [SyncChange]) {
+    public func saveSnapshot(_ snapshot: SyncQueueSnapshot) -> SyncPersistenceResult {
         do {
             let directoryURL = fileURL.deletingLastPathComponent()
             try FileManager.default.createDirectory(
                 at: directoryURL,
                 withIntermediateDirectories: true
             )
-            let data = try encoder.encode(changes)
+            let data = try encoder.encode(snapshot)
             try data.write(to: fileURL, options: [.atomic])
+            return SyncPersistenceResult(didPersist: true)
         } catch {
-            assertionFailure("Unable to persist sync queue: \(error)")
+            return SyncPersistenceResult(didPersist: false, errorDescription: String(describing: error))
         }
     }
 }

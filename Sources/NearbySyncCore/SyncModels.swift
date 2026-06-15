@@ -100,16 +100,31 @@ public struct SyncApplyResult: Equatable, Sendable {
     public var appliedChangeIDs: [UUID]
     public var ignoredDuplicateIDs: [UUID]
     public var ignoredStaleIDs: [UUID]
+    public var acknowledgedChangeIDs: [UUID]
 
     public init(
         appliedChangeIDs: [UUID] = [],
         ignoredDuplicateIDs: [UUID] = [],
-        ignoredStaleIDs: [UUID] = []
+        ignoredStaleIDs: [UUID] = [],
+        acknowledgedChangeIDs: [UUID] = []
     ) {
         self.appliedChangeIDs = appliedChangeIDs
         self.ignoredDuplicateIDs = ignoredDuplicateIDs
         self.ignoredStaleIDs = ignoredStaleIDs
+        self.acknowledgedChangeIDs = acknowledgedChangeIDs
     }
+}
+
+public struct SyncPersistenceResult: Equatable, Sendable {
+    public let didPersist: Bool
+    public let errorDescription: String?
+
+    public init(didPersist: Bool, errorDescription: String? = nil) {
+        self.didPersist = didPersist
+        self.errorDescription = errorDescription
+    }
+
+    public static let skipped = SyncPersistenceResult(didPersist: true)
 }
 
 public struct SyncTextConflictVersion: Codable, Equatable, Identifiable, Sendable {
@@ -223,7 +238,7 @@ public final class SyncTextConflictStore: @unchecked Sendable {
 
     public func activeConflicts(now: Date = Date()) -> [SyncTextConflictVersion] {
         let active = loadConflicts().filter { $0.expiresAt > now }
-        saveConflicts(active)
+        _ = saveConflicts(active)
         return active.sorted {
             if $0.preservedAt == $1.preservedAt {
                 return $0.id.uuidString < $1.id.uuidString
@@ -246,13 +261,13 @@ public final class SyncTextConflictStore: @unchecked Sendable {
         } else {
             conflicts.append(conflict)
         }
-        saveConflicts(conflicts)
+        _ = saveConflicts(conflicts)
         return activeConflicts()
     }
 
     public func removeConflict(id: UUID) -> [SyncTextConflictVersion] {
         let conflicts = activeConflicts().filter { $0.id != id }
-        saveConflicts(conflicts)
+        _ = saveConflicts(conflicts)
         return conflicts
     }
 
@@ -261,7 +276,13 @@ public final class SyncTextConflictStore: @unchecked Sendable {
         return (try? decoder.decode([SyncTextConflictVersion].self, from: data)) ?? []
     }
 
-    private func saveConflicts(_ conflicts: [SyncTextConflictVersion]) {
+    @discardableResult
+    public func saveConflictsForTesting(_ conflicts: [SyncTextConflictVersion]) -> SyncPersistenceResult {
+        saveConflicts(conflicts)
+    }
+
+    @discardableResult
+    private func saveConflicts(_ conflicts: [SyncTextConflictVersion]) -> SyncPersistenceResult {
         do {
             try FileManager.default.createDirectory(
                 at: fileURL.deletingLastPathComponent(),
@@ -269,8 +290,9 @@ public final class SyncTextConflictStore: @unchecked Sendable {
             )
             let data = try encoder.encode(conflicts)
             try data.write(to: fileURL, options: [.atomic])
+            return SyncPersistenceResult(didPersist: true)
         } catch {
-            assertionFailure("Unable to persist sync text conflicts: \(error)")
+            return SyncPersistenceResult(didPersist: false, errorDescription: String(describing: error))
         }
     }
 }

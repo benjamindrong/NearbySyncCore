@@ -34,8 +34,13 @@ public final class SyncEngine: @unchecked Sendable {
 
     public func nextEnvelope(limit: Int = 100) async -> SyncEnvelope? {
         let changes = await queue.pendingBatch(limit: limit)
-        guard !changes.isEmpty else { return nil }
-        return SyncEnvelope(senderDeviceID: deviceID, changes: changes)
+        let acknowledgements = await queue.acknowledgementBatch(limit: limit)
+        guard !changes.isEmpty || !acknowledgements.isEmpty else { return nil }
+        return SyncEnvelope(
+            senderDeviceID: deviceID,
+            changes: changes,
+            acknowledgedChangeIDs: acknowledgements
+        )
     }
 
     public func acknowledgeChanges(_ changeIDs: [UUID]) async {
@@ -43,7 +48,9 @@ public final class SyncEngine: @unchecked Sendable {
     }
 
     public func applyIncomingEnvelope(_ envelope: SyncEnvelope) async -> SyncApplyResult {
-        var result = SyncApplyResult()
+        await acknowledgeChanges(envelope.acknowledgedChangeIDs)
+
+        var result = SyncApplyResult(acknowledgedChangeIDs: envelope.acknowledgedChangeIDs)
 
         for change in envelope.changes {
             if await queue.hasApplied(change.id) {
@@ -62,6 +69,10 @@ public final class SyncEngine: @unchecked Sendable {
         }
 
         return result
+    }
+
+    public func markAcknowledgementSent(_ changeIDs: [UUID]) async {
+        await queue.markAcknowledgementSent(changeIDs)
     }
 
     public func pendingChangeCount() async -> Int {
