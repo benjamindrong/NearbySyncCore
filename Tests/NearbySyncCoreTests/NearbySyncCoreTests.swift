@@ -451,6 +451,27 @@ final class NearbySyncCoreTests: XCTestCase {
         XCTAssertTrue(conflicts.isEmpty)
     }
 
+    func testResolvedConflictDoesNotPreserveAgainFromStaleMessage() {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let conflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "current",
+            remoteText: "incoming",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            expiresAt: Date(timeIntervalSince1970: 1_000)
+        )
+        _ = conflictStore.preserve(conflict)
+
+        XCTAssertTrue(conflictStore.removeResolvedConflict(conflict).isEmpty)
+        XCTAssertTrue(conflictStore.preserve(conflict).isEmpty)
+    }
+
     func testResolvedConflictPayloadPreservesConflictWhenPeerDivergedFromBase() async throws {
         let conflictURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

@@ -204,7 +204,11 @@ public actor LocalFirstTextSyncStore: SyncStore {
                !applyResolvedConflictText(conflict, resolvedText: resolvedText, baseText: payload.baseText) {
                 return false
             }
-            _ = conflictStore.removeConflict(id: payload.conflictID)
+            if let conflict = payload.conflict {
+                _ = conflictStore.removeResolvedConflict(conflict)
+            } else {
+                _ = conflictStore.removeConflict(id: payload.conflictID)
+            }
             return true
         }
     }

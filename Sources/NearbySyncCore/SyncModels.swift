@@ -374,6 +374,17 @@ private struct TextChangeRange {
     }
 }
 
+private struct SyncTextResolvedConflict: Codable, Equatable {
+    let entityType: SyncEntityType
+    let entityID: String
+    let fieldID: String
+    let remoteText: String
+    let remoteData: Data?
+    let remoteUpdatedAt: Date
+    let resolvedAt: Date
+    let expiresAt: Date
+}
+
 public final class SyncTextConflictStore: @unchecked Sendable {
     private let fileURL: URL
     private let encoder = JSONEncoder()
@@ -395,6 +406,9 @@ public final class SyncTextConflictStore: @unchecked Sendable {
     }
 
     public func preserve(_ conflict: SyncTextConflictVersion) -> [SyncTextConflictVersion] {
+        guard !isResolved(conflict) else {
+            return activeConflicts()
+        }
         var conflicts = activeConflicts()
         if let index = conflicts.firstIndex(where: {
             $0.entityType == conflict.entityType
@@ -414,6 +428,16 @@ public final class SyncTextConflictStore: @unchecked Sendable {
 
     public func removeConflict(id: UUID) -> [SyncTextConflictVersion] {
         let conflicts = activeConflicts().filter { $0.id != id }
+        _ = saveConflicts(conflicts)
+        return conflicts
+    }
+
+    public func removeResolvedConflict(_ conflict: SyncTextConflictVersion) -> [SyncTextConflictVersion] {
+        recordResolvedConflict(conflict)
+        let conflicts = activeConflicts().filter {
+            $0.id != conflict.id
+                && !sameRemoteConflict($0, conflict)
+        }
         _ = saveConflicts(conflicts)
         return conflicts
     }
@@ -441,5 +465,77 @@ public final class SyncTextConflictStore: @unchecked Sendable {
         } catch {
             return SyncPersistenceResult(didPersist: false, errorDescription: String(describing: error))
         }
+    }
+
+    private func isResolved(_ conflict: SyncTextConflictVersion, now: Date = Date()) -> Bool {
+        loadResolvedConflicts(now: now).contains {
+            sameRemoteConflict($0, conflict)
+        }
+    }
+
+    private func recordResolvedConflict(_ conflict: SyncTextConflictVersion, now: Date = Date()) {
+        var resolvedConflicts = loadResolvedConflicts(now: now)
+        let resolvedConflict = SyncTextResolvedConflict(
+            entityType: conflict.entityType,
+            entityID: conflict.entityID,
+            fieldID: conflict.fieldID,
+            remoteText: conflict.remoteText,
+            remoteData: conflict.remoteData,
+            remoteUpdatedAt: conflict.remoteUpdatedAt,
+            resolvedAt: now,
+            expiresAt: now.addingTimeInterval(SyncTextConflictPolicy.retention)
+        )
+        if let index = resolvedConflicts.firstIndex(where: { sameRemoteConflict($0, conflict) }) {
+            resolvedConflicts[index] = resolvedConflict
+        } else {
+            resolvedConflicts.append(resolvedConflict)
+        }
+        _ = saveResolvedConflicts(resolvedConflicts)
+    }
+
+    private func loadResolvedConflicts(now: Date = Date()) -> [SyncTextResolvedConflict] {
+        guard let data = try? Data(contentsOf: resolvedFileURL) else { return [] }
+        let resolvedConflicts = ((try? decoder.decode([SyncTextResolvedConflict].self, from: data)) ?? [])
+            .filter { $0.expiresAt > now }
+        _ = saveResolvedConflicts(resolvedConflicts)
+        return resolvedConflicts
+    }
+
+    @discardableResult
+    private func saveResolvedConflicts(_ resolvedConflicts: [SyncTextResolvedConflict]) -> SyncPersistenceResult {
+        do {
+            try FileManager.default.createDirectory(
+                at: resolvedFileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let data = try encoder.encode(resolvedConflicts)
+            try data.write(to: resolvedFileURL, options: [.atomic])
+            return SyncPersistenceResult(didPersist: true)
+        } catch {
+            return SyncPersistenceResult(didPersist: false, errorDescription: String(describing: error))
+        }
+    }
+
+    private func sameRemoteConflict(_ lhs: SyncTextConflictVersion, _ rhs: SyncTextConflictVersion) -> Bool {
+        lhs.entityType == rhs.entityType
+            && lhs.entityID == rhs.entityID
+            && lhs.fieldID == rhs.fieldID
+            && lhs.remoteUpdatedAt == rhs.remoteUpdatedAt
+            && lhs.remoteText == rhs.remoteText
+            && lhs.remoteData == rhs.remoteData
+    }
+
+    private func sameRemoteConflict(_ lhs: SyncTextResolvedConflict, _ rhs: SyncTextConflictVersion) -> Bool {
+        lhs.entityType == rhs.entityType
+            && lhs.entityID == rhs.entityID
+            && lhs.fieldID == rhs.fieldID
+            && lhs.remoteUpdatedAt == rhs.remoteUpdatedAt
+            && lhs.remoteText == rhs.remoteText
+            && lhs.remoteData == rhs.remoteData
+    }
+
+    private var resolvedFileURL: URL {
+        fileURL.deletingLastPathComponent()
+            .appendingPathComponent("sync-resolved-conflicts.json")
     }
 }
