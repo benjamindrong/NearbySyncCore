@@ -472,6 +472,28 @@ final class NearbySyncCoreTests: XCTestCase {
         XCTAssertTrue(conflictStore.preserve(conflict).isEmpty)
     }
 
+    func testPeerPreservedConflictPerspectiveShowsCurrentLocalAndPeerVersionToSync() {
+        let conflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "iPhone offline edit",
+            remoteText: "Mac edit",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            preservedAt: Date(timeIntervalSince1970: 201),
+            expiresAt: Date(timeIntervalSince1970: 1_000)
+        )
+
+        let perspective = conflict.perspectiveForPeerPreservedConflict(currentLocalText: "Mac edit with more typing")
+        let normalized = conflict.normalizedForPeerPreservedConflict(currentLocalText: "Mac edit with more typing")
+
+        XCTAssertEqual(perspective.localText, "Mac edit with more typing")
+        XCTAssertEqual(perspective.versionToSyncText, "iPhone offline edit")
+        XCTAssertEqual(normalized.localText, "Mac edit with more typing")
+        XCTAssertEqual(normalized.remoteText, "iPhone offline edit")
+        XCTAssertEqual(normalized.remoteUpdatedAt, conflict.preservedAt)
+    }
+
     func testResolvedConflictPayloadPreservesConflictWhenPeerDivergedFromBase() async throws {
         let conflictURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

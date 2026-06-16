@@ -261,6 +261,52 @@ public struct SyncTextConflictVersion: Codable, Equatable, Identifiable, Sendabl
     }
 }
 
+public struct SyncTextConflictPerspective: Equatable, Sendable {
+    public let localText: String
+    public let versionToSyncText: String
+
+    public init(localText: String, versionToSyncText: String) {
+        self.localText = localText
+        self.versionToSyncText = versionToSyncText
+    }
+}
+
+public extension SyncTextConflictVersion {
+    func perspectiveForPeerPreservedConflict(currentLocalText: String) -> SyncTextConflictPerspective {
+        if localText == remoteText {
+            return SyncTextConflictPerspective(
+                localText: currentLocalText,
+                versionToSyncText: remoteText
+            )
+        }
+
+        return SyncTextConflictPerspective(
+            localText: currentLocalText,
+            versionToSyncText: localText
+        )
+    }
+
+    func normalizedForPeerPreservedConflict(
+        currentLocalText: String,
+        remoteUpdatedAt: Date? = nil
+    ) -> SyncTextConflictVersion {
+        let perspective = perspectiveForPeerPreservedConflict(currentLocalText: currentLocalText)
+        return SyncTextConflictVersion(
+            id: id,
+            entityType: entityType,
+            entityID: entityID,
+            fieldID: fieldID,
+            remoteOperation: remoteOperation,
+            localText: perspective.localText,
+            remoteText: perspective.versionToSyncText,
+            remoteData: nil,
+            remoteUpdatedAt: remoteUpdatedAt ?? preservedAt,
+            preservedAt: preservedAt,
+            expiresAt: expiresAt
+        )
+    }
+}
+
 public enum SyncTextConflictPolicy {
     public static let retention: TimeInterval = 7 * 24 * 60 * 60
 

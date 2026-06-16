@@ -172,6 +172,10 @@ public actor LocalFirstTextSyncStore: SyncStore {
         conflictStore.removeConflict(id: id)
     }
 
+    public func removeResolvedConflict(_ conflict: SyncTextConflictVersion) -> [SyncTextConflictVersion] {
+        conflictStore.removeResolvedConflict(conflict)
+    }
+
     public func restore(_ conflict: SyncTextConflictVersion) -> [SyncTextConflictVersion] {
         let key = RecordKey(type: conflict.entityType, id: conflict.entityID)
         records[key] = SyncRecord(
@@ -188,7 +192,7 @@ public actor LocalFirstTextSyncStore: SyncStore {
             updatedAt: conflict.remoteUpdatedAt,
             isDeleted: false
         )
-        return conflictStore.removeConflict(id: conflict.id)
+        return conflictStore.removeResolvedConflict(conflict)
     }
 
     private func applyIncomingConflictMetadata(_ change: SyncChange) -> Bool {
@@ -196,7 +200,7 @@ public actor LocalFirstTextSyncStore: SyncStore {
         switch payload.action {
         case .preserved:
             guard let conflict = payload.conflict else { return false }
-            _ = conflictStore.preserve(conflict)
+            _ = conflictStore.preserve(normalizedIncomingConflict(conflict))
             return true
         case .resolved:
             if let conflict = payload.conflict,
@@ -211,6 +215,14 @@ public actor LocalFirstTextSyncStore: SyncStore {
             }
             return true
         }
+    }
+
+    private func normalizedIncomingConflict(_ conflict: SyncTextConflictVersion) -> SyncTextConflictVersion {
+        let key = RecordKey(type: conflict.entityType, id: conflict.entityID)
+        guard let localText = records[key].flatMap({ String(data: $0.payload, encoding: .utf8) }) else {
+            return conflict
+        }
+        return conflict.normalizedForPeerPreservedConflict(currentLocalText: localText)
     }
 
     private func applyResolvedConflictText(
