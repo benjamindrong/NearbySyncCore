@@ -197,6 +197,7 @@ public struct SyncTextConflictVersion: Codable, Equatable, Identifiable, Sendabl
     public let entityType: SyncEntityType
     public let entityID: String
     public let fieldID: String
+    public let contextID: String?
     public let remoteOperation: SyncOperation
     public let localText: String
     public let remoteText: String
@@ -210,6 +211,7 @@ public struct SyncTextConflictVersion: Codable, Equatable, Identifiable, Sendabl
         entityType: SyncEntityType,
         entityID: String,
         fieldID: String,
+        contextID: String? = nil,
         remoteOperation: SyncOperation = .upsert,
         localText: String,
         remoteText: String,
@@ -222,6 +224,7 @@ public struct SyncTextConflictVersion: Codable, Equatable, Identifiable, Sendabl
         self.entityType = entityType
         self.entityID = entityID
         self.fieldID = fieldID
+        self.contextID = contextID
         self.remoteOperation = remoteOperation
         self.localText = localText
         self.remoteText = remoteText
@@ -236,6 +239,7 @@ public struct SyncTextConflictVersion: Codable, Equatable, Identifiable, Sendabl
         case entityType
         case entityID
         case fieldID
+        case contextID
         case remoteOperation
         case localText
         case remoteText
@@ -251,6 +255,7 @@ public struct SyncTextConflictVersion: Codable, Equatable, Identifiable, Sendabl
         entityType = try container.decode(SyncEntityType.self, forKey: .entityType)
         entityID = try container.decode(String.self, forKey: .entityID)
         fieldID = try container.decode(String.self, forKey: .fieldID)
+        contextID = try container.decodeIfPresent(String.self, forKey: .contextID)
         remoteOperation = try container.decodeIfPresent(SyncOperation.self, forKey: .remoteOperation) ?? .upsert
         localText = try container.decode(String.self, forKey: .localText)
         remoteText = try container.decode(String.self, forKey: .remoteText)
@@ -296,6 +301,7 @@ public extension SyncTextConflictVersion {
             entityType: entityType,
             entityID: entityID,
             fieldID: fieldID,
+            contextID: contextID,
             remoteOperation: remoteOperation,
             localText: perspective.localText,
             remoteText: perspective.versionToSyncText,
@@ -424,11 +430,59 @@ private struct SyncTextResolvedConflict: Codable, Equatable {
     let entityType: SyncEntityType
     let entityID: String
     let fieldID: String
+    let localText: String?
     let remoteText: String
     let remoteData: Data?
     let remoteUpdatedAt: Date
     let resolvedAt: Date
     let expiresAt: Date
+
+    private enum CodingKeys: String, CodingKey {
+        case entityType
+        case entityID
+        case fieldID
+        case localText
+        case remoteText
+        case remoteData
+        case remoteUpdatedAt
+        case resolvedAt
+        case expiresAt
+    }
+
+    init(
+        entityType: SyncEntityType,
+        entityID: String,
+        fieldID: String,
+        localText: String?,
+        remoteText: String,
+        remoteData: Data?,
+        remoteUpdatedAt: Date,
+        resolvedAt: Date,
+        expiresAt: Date
+    ) {
+        self.entityType = entityType
+        self.entityID = entityID
+        self.fieldID = fieldID
+        self.localText = localText
+        self.remoteText = remoteText
+        self.remoteData = remoteData
+        self.remoteUpdatedAt = remoteUpdatedAt
+        self.resolvedAt = resolvedAt
+        self.expiresAt = expiresAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        entityType = try container.decode(SyncEntityType.self, forKey: .entityType)
+        entityID = try container.decode(String.self, forKey: .entityID)
+        fieldID = try container.decode(String.self, forKey: .fieldID)
+        localText = try container.decodeIfPresent(String.self, forKey: .localText)
+        remoteText = try container.decode(String.self, forKey: .remoteText)
+        remoteData = try container.decodeIfPresent(Data.self, forKey: .remoteData)
+        remoteUpdatedAt = try container.decode(Date.self, forKey: .remoteUpdatedAt)
+        resolvedAt = try container.decode(Date.self, forKey: .resolvedAt)
+        expiresAt = try container.decode(Date.self, forKey: .expiresAt)
+    }
 }
 
 public final class SyncTextConflictStore: @unchecked Sendable {
@@ -455,19 +509,10 @@ public final class SyncTextConflictStore: @unchecked Sendable {
         guard !isResolved(conflict) else {
             return activeConflicts()
         }
-        var conflicts = activeConflicts()
-        if let index = conflicts.firstIndex(where: {
-            $0.entityType == conflict.entityType
-                && $0.entityID == conflict.entityID
-                && $0.fieldID == conflict.fieldID
-                && $0.remoteUpdatedAt == conflict.remoteUpdatedAt
-                && $0.remoteText == conflict.remoteText
-                && $0.remoteData == conflict.remoteData
-        }) {
-            conflicts[index] = conflict
-        } else {
-            conflicts.append(conflict)
-        }
+        // A text field can only have one reviewable conflict at a time. Newer
+        // preserved metadata replaces stale rows for the same entity field.
+        var conflicts = activeConflicts().filter { !sameLogicalConflict($0, conflict) }
+        conflicts.append(conflict)
         _ = saveConflicts(conflicts)
         return activeConflicts()
     }
@@ -479,13 +524,23 @@ public final class SyncTextConflictStore: @unchecked Sendable {
     }
 
     public func removeResolvedConflict(_ conflict: SyncTextConflictVersion) -> [SyncTextConflictVersion] {
-        recordResolvedConflict(conflict)
-        let conflicts = activeConflicts().filter {
-            $0.id != conflict.id
-                && !sameRemoteConflict($0, conflict)
+        let conflicts = activeConflicts()
+        // Resolving a conflict is terminal for the whole entity field, not just
+        // the tapped row. This clears duplicate preserved rows from stale sync.
+        let resolvedConflicts = conflicts.filter {
+            sameLogicalConflict($0, conflict) || sameRemoteConflict($0, conflict)
         }
-        _ = saveConflicts(conflicts)
-        return conflicts
+        for resolvedConflict in resolvedConflicts {
+            recordResolvedConflict(resolvedConflict)
+        }
+        if !resolvedConflicts.contains(where: { $0.id == conflict.id }) {
+            recordResolvedConflict(conflict)
+        }
+        let remainingConflicts = conflicts.filter {
+            !sameLogicalConflict($0, conflict) && !sameRemoteConflict($0, conflict)
+        }
+        _ = saveConflicts(remainingConflicts)
+        return remainingConflicts
     }
 
     private func loadConflicts() -> [SyncTextConflictVersion] {
@@ -494,8 +549,13 @@ public final class SyncTextConflictStore: @unchecked Sendable {
     }
 
     @discardableResult
-    public func saveConflictsForTesting(_ conflicts: [SyncTextConflictVersion]) -> SyncPersistenceResult {
+    public func replaceConflicts(_ conflicts: [SyncTextConflictVersion]) -> SyncPersistenceResult {
         saveConflicts(conflicts)
+    }
+
+    @discardableResult
+    public func saveConflictsForTesting(_ conflicts: [SyncTextConflictVersion]) -> SyncPersistenceResult {
+        replaceConflicts(conflicts)
     }
 
     @discardableResult
@@ -525,6 +585,7 @@ public final class SyncTextConflictStore: @unchecked Sendable {
             entityType: conflict.entityType,
             entityID: conflict.entityID,
             fieldID: conflict.fieldID,
+            localText: conflict.localText,
             remoteText: conflict.remoteText,
             remoteData: conflict.remoteData,
             remoteUpdatedAt: conflict.remoteUpdatedAt,
@@ -571,13 +632,23 @@ public final class SyncTextConflictStore: @unchecked Sendable {
             && lhs.remoteData == rhs.remoteData
     }
 
-    private func sameRemoteConflict(_ lhs: SyncTextResolvedConflict, _ rhs: SyncTextConflictVersion) -> Bool {
+    private func sameLogicalConflict(_ lhs: SyncTextConflictVersion, _ rhs: SyncTextConflictVersion) -> Bool {
         lhs.entityType == rhs.entityType
             && lhs.entityID == rhs.entityID
             && lhs.fieldID == rhs.fieldID
-            && lhs.remoteUpdatedAt == rhs.remoteUpdatedAt
+    }
+
+    private func sameRemoteConflict(_ lhs: SyncTextResolvedConflict, _ rhs: SyncTextConflictVersion) -> Bool {
+        guard lhs.entityType == rhs.entityType,
+              lhs.entityID == rhs.entityID,
+              lhs.fieldID == rhs.fieldID else {
+            return false
+        }
+        let sameOrientation = lhs.remoteUpdatedAt == rhs.remoteUpdatedAt
             && lhs.remoteText == rhs.remoteText
-            && lhs.remoteData == rhs.remoteData
+        let reversedOrientation = lhs.localText == rhs.remoteText
+            && lhs.remoteText == rhs.localText
+        return sameOrientation || reversedOrientation
     }
 
     private var resolvedFileURL: URL {

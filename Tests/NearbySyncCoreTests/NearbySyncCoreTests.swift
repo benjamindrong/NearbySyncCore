@@ -33,11 +33,13 @@ final class NearbySyncCoreTests: XCTestCase {
         )
 
         let envelope = await engine.nextEnvelope()
-        XCTAssertEqual(await engine.pendingChangeCount(), 1)
+        let pendingCountBeforeAck = await engine.pendingChangeCount()
+        XCTAssertEqual(pendingCountBeforeAck, 1)
 
         await engine.acknowledgeChanges(try XCTUnwrap(envelope).changes.map(\.id))
 
-        XCTAssertEqual(await engine.pendingChangeCount(), 0)
+        let pendingCountAfterAck = await engine.pendingChangeCount()
+        XCTAssertEqual(pendingCountAfterAck, 0)
     }
 
     func testSentEnvelopeStaysQueuedUntilAck() async {
@@ -52,7 +54,8 @@ final class NearbySyncCoreTests: XCTestCase {
 
         _ = await engine.nextEnvelope()
 
-        XCTAssertEqual(await engine.pendingChangeCount(), 1)
+        let pendingCount = await engine.pendingChangeCount()
+        XCTAssertEqual(pendingCount, 1)
     }
 
     func testDuplicateIncomingChangeIsNotAppliedTwice() async {
@@ -142,7 +145,8 @@ final class NearbySyncCoreTests: XCTestCase {
 
         let result = await sender.applyIncomingEnvelope(try XCTUnwrap(acknowledgement))
 
-        XCTAssertEqual(await sender.pendingChangeCount(), 0)
+        let pendingCount = await sender.pendingChangeCount()
+        XCTAssertEqual(pendingCount, 0)
         XCTAssertEqual(acknowledgement?.acknowledgedChangeIDs, [change.id])
         XCTAssertEqual(result.acknowledgedLocalChanges, [change])
     }
@@ -185,7 +189,8 @@ final class NearbySyncCoreTests: XCTestCase {
         let reconnectEnvelope = await engine.nextEnvelope()
 
         XCTAssertEqual(reconnectEnvelope?.changes.count, 2)
-        XCTAssertEqual(await engine.pendingChangeCount(), 2)
+        let pendingCount = await engine.pendingChangeCount()
+        XCTAssertEqual(pendingCount, 2)
     }
 
     func testLocalFirstTextStorePreservesRemoteTextConflict() async {
@@ -396,7 +401,8 @@ final class NearbySyncCoreTests: XCTestCase {
         _ = await store.restore(conflict)
 
         let envelope = await engine.nextEnvelope()
-        XCTAssertEqual(await engine.pendingChangeCount(), 0)
+        let pendingCount = await engine.pendingChangeCount()
+        XCTAssertEqual(pendingCount, 0)
         XCTAssertNil(envelope)
     }
 
@@ -437,6 +443,7 @@ final class NearbySyncCoreTests: XCTestCase {
         let change = SyncChange(
             entityType: .conflict,
             entityID: conflict.id.uuidString,
+            operation: .upsert,
             payload: payload,
             updatedAt: Date(timeIntervalSince1970: 300),
             originDeviceID: "device-a"
@@ -470,6 +477,136 @@ final class NearbySyncCoreTests: XCTestCase {
 
         XCTAssertTrue(conflictStore.removeResolvedConflict(conflict).isEmpty)
         XCTAssertTrue(conflictStore.preserve(conflict).isEmpty)
+    }
+
+    func testTextConflictStoreKeepsOneActiveConflictPerEntityField() {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let expiresAt = Date().addingTimeInterval(1_000)
+        let firstConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Mac local",
+            remoteText: "iPhone incoming",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            preservedAt: Date(timeIntervalSince1970: 201),
+            expiresAt: expiresAt
+        )
+        let duplicateConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Mac local",
+            remoteText: "iPhone incoming again",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 250),
+            preservedAt: Date(timeIntervalSince1970: 251),
+            expiresAt: expiresAt
+        )
+
+        _ = conflictStore.preserve(firstConflict)
+        let conflicts = conflictStore.preserve(duplicateConflict)
+
+        XCTAssertEqual(conflicts.count, 1)
+        XCTAssertEqual(conflicts.first?.remoteText, "iPhone incoming again")
+    }
+
+    func testRemovingResolvedConflictClearsDuplicateEntityFieldConflicts() {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let expiresAt = Date().addingTimeInterval(1_000)
+        let firstConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Mac local",
+            remoteText: "iPhone incoming",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            preservedAt: Date(timeIntervalSince1970: 201),
+            expiresAt: expiresAt
+        )
+        let duplicateConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Mac local edited",
+            remoteText: "iPhone incoming edited",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 250),
+            preservedAt: Date(timeIntervalSince1970: 251),
+            expiresAt: expiresAt
+        )
+        _ = conflictStore.replaceConflicts([firstConflict, duplicateConflict])
+
+        XCTAssertTrue(conflictStore.removeResolvedConflict(firstConflict).isEmpty)
+        XCTAssertTrue(conflictStore.preserve(duplicateConflict).isEmpty)
+    }
+
+    func testResolvedConflictDoesNotPreserveAgainWhenStaleMessageIsReversed() {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let conflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Mac local",
+            remoteText: "iPhone incoming",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            expiresAt: Date(timeIntervalSince1970: 1_000)
+        )
+        let staleReversedConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "iPhone incoming",
+            remoteText: "Mac local",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 250),
+            expiresAt: Date(timeIntervalSince1970: 1_000)
+        )
+        _ = conflictStore.preserve(conflict)
+
+        XCTAssertTrue(conflictStore.removeResolvedConflict(conflict).isEmpty)
+        XCTAssertTrue(conflictStore.preserve(staleReversedConflict).isEmpty)
+    }
+
+    func testResolvedConflictDoesNotPreserveAgainWhenRichTextDataChanges() {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let conflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Mac local",
+            remoteText: "iPhone incoming",
+            remoteData: Data("rich-a".utf8),
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            expiresAt: Date(timeIntervalSince1970: 1_000)
+        )
+        let staleConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Mac local",
+            remoteText: "iPhone incoming",
+            remoteData: Data("rich-b".utf8),
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            expiresAt: Date(timeIntervalSince1970: 1_000)
+        )
+        _ = conflictStore.preserve(conflict)
+
+        XCTAssertTrue(conflictStore.removeResolvedConflict(conflict).isEmpty)
+        XCTAssertTrue(conflictStore.preserve(staleConflict).isEmpty)
     }
 
     func testPeerPreservedConflictPerspectiveShowsCurrentLocalAndPeerVersionToSync() {
@@ -531,6 +668,7 @@ final class NearbySyncCoreTests: XCTestCase {
         let change = SyncChange(
             entityType: .conflict,
             entityID: conflict.id.uuidString,
+            operation: .upsert,
             payload: payload,
             updatedAt: Date(timeIntervalSince1970: 300),
             originDeviceID: "device-a"
