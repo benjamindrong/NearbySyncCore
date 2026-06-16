@@ -5,6 +5,7 @@ public enum SyncEntityType: String, Codable, CaseIterable, Sendable {
     case collection
     case marker
     case attachment
+    case conflict
 }
 
 public enum SyncOperation: String, Codable, Sendable {
@@ -96,22 +97,86 @@ public struct SyncRecord: Equatable, Sendable {
     }
 }
 
+public struct SyncTextPayload: Codable, Equatable, Sendable {
+    public let text: String
+    public let baseText: String?
+
+    public init(text: String, baseText: String? = nil) {
+        self.text = text
+        self.baseText = baseText
+    }
+
+    public func encoded() throws -> Data {
+        try JSONEncoder().encode(self)
+    }
+
+    public static func decodeText(from data: Data) -> SyncTextPayload {
+        if let payload = try? JSONDecoder().decode(SyncTextPayload.self, from: data) {
+            return payload
+        }
+        return SyncTextPayload(text: String(data: data, encoding: .utf8) ?? "", baseText: nil)
+    }
+}
+
 public struct SyncApplyResult: Equatable, Sendable {
     public var appliedChangeIDs: [UUID]
     public var ignoredDuplicateIDs: [UUID]
     public var ignoredStaleIDs: [UUID]
     public var acknowledgedChangeIDs: [UUID]
+    public var acknowledgedLocalChanges: [SyncChange]
+    public var preservedConflicts: [SyncTextConflictVersion]
 
     public init(
         appliedChangeIDs: [UUID] = [],
         ignoredDuplicateIDs: [UUID] = [],
         ignoredStaleIDs: [UUID] = [],
-        acknowledgedChangeIDs: [UUID] = []
+        acknowledgedChangeIDs: [UUID] = [],
+        acknowledgedLocalChanges: [SyncChange] = [],
+        preservedConflicts: [SyncTextConflictVersion] = []
     ) {
         self.appliedChangeIDs = appliedChangeIDs
         self.ignoredDuplicateIDs = ignoredDuplicateIDs
         self.ignoredStaleIDs = ignoredStaleIDs
         self.acknowledgedChangeIDs = acknowledgedChangeIDs
+        self.acknowledgedLocalChanges = acknowledgedLocalChanges
+        self.preservedConflicts = preservedConflicts
+    }
+}
+
+public enum SyncTextConflictAction: String, Codable, Sendable {
+    case preserved
+    case resolved
+}
+
+public struct SyncTextConflictPayload: Codable, Equatable, Sendable {
+    public let action: SyncTextConflictAction
+    public let conflict: SyncTextConflictVersion?
+    public let conflictID: UUID
+    public let resolvedText: String?
+    public let baseText: String?
+    public let updatedAt: Date
+
+    public init(
+        action: SyncTextConflictAction,
+        conflict: SyncTextConflictVersion,
+        resolvedText: String? = nil,
+        baseText: String? = nil,
+        updatedAt: Date = Date()
+    ) {
+        self.action = action
+        self.conflict = conflict
+        conflictID = conflict.id
+        self.resolvedText = resolvedText
+        self.baseText = baseText
+        self.updatedAt = updatedAt
+    }
+
+    public func encoded() throws -> Data {
+        try JSONEncoder().encode(self)
+    }
+
+    public static func decode(from data: Data) throws -> SyncTextConflictPayload {
+        try JSONDecoder().decode(SyncTextConflictPayload.self, from: data)
     }
 }
 
@@ -224,6 +289,88 @@ public enum SyncTextConflictPolicy {
             preservedAt: preservedAt,
             expiresAt: preservedAt.addingTimeInterval(retention)
         )
+    }
+}
+
+public enum SyncTextMergeResult: Equatable, Sendable {
+    case apply(remoteText: String)
+    case noOp
+    case merged(String)
+    case conflict
+
+    public var mergedText: String? {
+        switch self {
+        case .apply(let remoteText), .merged(let remoteText):
+            remoteText
+        case .noOp, .conflict:
+            nil
+        }
+    }
+}
+
+public enum SyncThreeWayTextMergePolicy {
+    public static func merge(base: String?, local: String, remote: String) -> SyncTextMergeResult {
+        guard let base else {
+            return local == remote ? .noOp : .conflict
+        }
+        if local == remote { return .noOp }
+        if local == base { return .apply(remoteText: remote) }
+        if remote == base { return .noOp }
+        return nonOverlappingMerge(base: base, local: local, remote: remote).map(SyncTextMergeResult.merged) ?? .conflict
+    }
+
+    private static func nonOverlappingMerge(base: String, local: String, remote: String) -> String? {
+        let baseCharacters = Array(base)
+        let localChange = changedRange(base: baseCharacters, changed: Array(local))
+        let remoteChange = changedRange(base: baseCharacters, changed: Array(remote))
+        guard localChange.lowerBound != remoteChange.lowerBound else { return nil }
+        guard !localChange.overlaps(remoteChange) else { return nil }
+
+        if remoteChange.upperBound <= localChange.lowerBound {
+            let beforeRemote = String(baseCharacters[..<remoteChange.lowerBound])
+            let middle = String(baseCharacters[remoteChange.upperBound..<localChange.lowerBound])
+            let afterLocal = String(baseCharacters[localChange.upperBound...])
+            return beforeRemote + remoteChange.replacement + middle + localChange.replacement + afterLocal
+        }
+
+        let beforeLocal = String(baseCharacters[..<localChange.lowerBound])
+        let middle = String(baseCharacters[localChange.upperBound..<remoteChange.lowerBound])
+        let afterRemote = String(baseCharacters[remoteChange.upperBound...])
+        return beforeLocal + localChange.replacement + middle + remoteChange.replacement + afterRemote
+    }
+
+    private static func changedRange(base: [Character], changed: [Character]) -> TextChangeRange {
+        var prefix = 0
+        while prefix < base.count,
+              prefix < changed.count,
+              base[prefix] == changed[prefix] {
+            prefix += 1
+        }
+
+        var suffixBase = base.count
+        var suffixChanged = changed.count
+        while suffixBase > prefix,
+              suffixChanged > prefix,
+              base[suffixBase - 1] == changed[suffixChanged - 1] {
+            suffixBase -= 1
+            suffixChanged -= 1
+        }
+
+        return TextChangeRange(
+            lowerBound: prefix,
+            upperBound: suffixBase,
+            replacement: String(changed[prefix..<suffixChanged])
+        )
+    }
+}
+
+private struct TextChangeRange {
+    let lowerBound: Int
+    let upperBound: Int
+    let replacement: String
+
+    func overlaps(_ other: TextChangeRange) -> Bool {
+        lowerBound < other.upperBound && other.lowerBound < upperBound
     }
 }
 

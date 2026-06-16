@@ -2,7 +2,11 @@ import Foundation
 
 public actor SyncQueue {
     private var pendingChanges: [SyncChange] = []
+    // Applied IDs are persisted so a peer restart cannot replay the same remote
+    // change and re-trigger app-level side effects or duplicate conflicts.
     private var appliedChangeIDs: Set<UUID> = []
+    // Acknowledgements are queued separately from content changes. They may be
+    // sent in an ack-only envelope and removed once transport confirms send.
     private var pendingAcknowledgementIDs: Set<UUID> = []
     private let persistence: SyncQueuePersistence?
 
@@ -15,6 +19,8 @@ public actor SyncQueue {
     }
 
     public func enqueue(_ change: SyncChange) {
+        // Collapse pending local edits by entity. The queue represents latest
+        // document state for a target, not every intermediate typing event.
         if let existingIndex = pendingChanges.firstIndex(where: { $0.syncTarget == change.syncTarget }) {
             pendingChanges[existingIndex] = change
             persistPendingChanges()
@@ -34,6 +40,11 @@ public actor SyncQueue {
         Array(pendingChanges.prefix(limit))
     }
 
+    public func pendingChanges(withIDs changeIDs: [UUID]) -> [SyncChange] {
+        let ids = Set(changeIDs)
+        return pendingChanges.filter { ids.contains($0.id) }
+    }
+
     public func acknowledgementBatch(limit: Int = 100) -> [UUID] {
         Array(pendingAcknowledgementIDs.prefix(limit))
     }
@@ -41,6 +52,8 @@ public actor SyncQueue {
     public func markAcknowledged(_ acknowledgedChangeIDs: [UUID]) {
         let acknowledgedIDs = Set(acknowledgedChangeIDs)
         pendingChanges.removeAll { acknowledgedIDs.contains($0.id) }
+        // If a peer acknowledges an acknowledgement-only envelope, drop those
+        // ack IDs too; there is no useful retry once both sides have seen them.
         pendingAcknowledgementIDs.subtract(acknowledgedIDs)
         persistPendingChanges()
     }
@@ -51,6 +64,8 @@ public actor SyncQueue {
 
     public func markApplied(_ changeID: UUID) {
         appliedChangeIDs.insert(changeID)
+        // Applying a remote change never creates a local content change. The
+        // only outbound work generated here is metadata saying it was received.
         pendingAcknowledgementIDs.insert(changeID)
         persistPendingChanges()
     }
@@ -81,6 +96,8 @@ public protocol SyncQueuePersistence: Sendable {
 }
 
 public struct SyncQueueSnapshot: Codable, Equatable, Sendable {
+    // Snapshot shape is intentionally broader than "pending changes" so restart
+    // behavior preserves duplicate detection and pending acknowledgements.
     public var pendingChanges: [SyncChange]
     public var appliedChangeIDs: [UUID]
     public var pendingAcknowledgementIDs: [UUID]
@@ -110,6 +127,8 @@ public final class FileBackedSyncQueuePersistence: SyncQueuePersistence, @unchec
         if let snapshot = try? decoder.decode(SyncQueueSnapshot.self, from: data) {
             return snapshot
         }
+        // MYR-71 wrote a bare [SyncChange]. Keep reading that legacy queue so
+        // existing installs do not lose unsent local edits on upgrade.
         if let legacyChanges = try? decoder.decode([SyncChange].self, from: data) {
             return SyncQueueSnapshot(pendingChanges: legacyChanges)
         }

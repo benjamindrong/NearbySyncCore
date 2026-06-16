@@ -36,6 +36,9 @@ public final class SyncEngine: @unchecked Sendable {
         let changes = await queue.pendingBatch(limit: limit)
         let acknowledgements = await queue.acknowledgementBatch(limit: limit)
         guard !changes.isEmpty || !acknowledgements.isEmpty else { return nil }
+        // Envelopes may carry content, acknowledgements, or both. This keeps the
+        // public acknowledgedChangeIDs API meaningful without requiring a local
+        // content edit just to clear a peer's send queue.
         return SyncEnvelope(
             senderDeviceID: deviceID,
             changes: changes,
@@ -43,14 +46,23 @@ public final class SyncEngine: @unchecked Sendable {
         )
     }
 
-    public func acknowledgeChanges(_ changeIDs: [UUID]) async {
+    @discardableResult
+    public func acknowledgeChanges(_ changeIDs: [UUID]) async -> [SyncChange] {
+        let acknowledgedLocalChanges = await queue.pendingChanges(withIDs: changeIDs)
+        await store.markLocalChangesAcknowledged(acknowledgedLocalChanges)
         await queue.markAcknowledged(changeIDs)
+        return acknowledgedLocalChanges
     }
 
     public func applyIncomingEnvelope(_ envelope: SyncEnvelope) async -> SyncApplyResult {
-        await acknowledgeChanges(envelope.acknowledgedChangeIDs)
+        // Ack metadata is terminal queue state. It is processed before content
+        // so a mixed envelope can clear old sends even if new changes are stale.
+        let acknowledgedLocalChanges = await acknowledgeChanges(envelope.acknowledgedChangeIDs)
 
-        var result = SyncApplyResult(acknowledgedChangeIDs: envelope.acknowledgedChangeIDs)
+        var result = SyncApplyResult(
+            acknowledgedChangeIDs: envelope.acknowledgedChangeIDs,
+            acknowledgedLocalChanges: acknowledgedLocalChanges
+        )
 
         for change in envelope.changes {
             if await queue.hasApplied(change.id) {
@@ -59,7 +71,11 @@ public final class SyncEngine: @unchecked Sendable {
             }
 
             await queue.markApplied(change.id)
+            // Store application is deliberately one-way. If a host app wants to
+            // publish a follow-up edit, it must call recordLocalChange itself.
             let didApply = await store.apply(change)
+            let preservedConflicts = await store.preservedConflictsForLastApply()
+            result.preservedConflicts.append(contentsOf: preservedConflicts)
 
             if didApply {
                 result.appliedChangeIDs.append(change.id)
@@ -81,5 +97,9 @@ public final class SyncEngine: @unchecked Sendable {
 
     public func records() async -> [SyncRecord] {
         await store.allRecords()
+    }
+
+    public func record(for entityType: SyncEntityType, entityID: String) async -> SyncRecord? {
+        await store.record(for: entityType, entityID: entityID)
     }
 }
