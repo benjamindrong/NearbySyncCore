@@ -249,20 +249,16 @@ public actor LocalFirstTextSyncStore: SyncStore {
             _ = conflictStore.removeConflict(id: conflict.id)
             return true
         case .conflict:
-            guard let preservedConflict = SyncTextConflictPolicy.conflictIfTextDiverged(
+            let record = SyncRecord(
                 entityType: conflict.entityType,
                 entityID: conflict.entityID,
-                fieldID: conflict.fieldID,
-                remoteOperation: .upsert,
-                localText: localText,
-                remoteText: resolvedText,
-                remoteUpdatedAt: Date()
-            ) else {
-                return true
-            }
-            _ = conflictStore.preserve(preservedConflict)
-            lastPreservedConflicts = [preservedConflict]
-            return false
+                payload: Data(resolvedText.utf8),
+                updatedAt: Date(),
+                isDeleted: false
+            )
+            records[key] = record
+            remoteBaselines[key] = record
+            return true
         }
     }
 

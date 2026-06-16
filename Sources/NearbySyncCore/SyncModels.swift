@@ -276,6 +276,55 @@ public struct SyncTextConflictPerspective: Equatable, Sendable {
     }
 }
 
+public struct SyncTextConflictResolution: Equatable, Sendable {
+    public let resolvedText: String
+    public let baseText: String
+    public let resolvedData: Data?
+    public let usesRemoteData: Bool
+
+    public init(
+        resolvedText: String,
+        baseText: String,
+        resolvedData: Data? = nil,
+        usesRemoteData: Bool = false
+    ) {
+        self.resolvedText = resolvedText
+        self.baseText = baseText
+        self.resolvedData = resolvedData
+        self.usesRemoteData = usesRemoteData
+    }
+}
+
+public enum SyncTextConflictResolutionChoice: Equatable, Sendable {
+    case keepLocal(currentLocalText: String, currentLocalData: Data? = nil)
+    case acceptIncoming
+}
+
+public enum SyncTextConflictResolver {
+    public static func resolve(
+        _ conflict: SyncTextConflictVersion,
+        choice: SyncTextConflictResolutionChoice
+    ) -> SyncTextConflictResolution {
+        switch choice {
+        case .keepLocal(let currentLocalText, let currentLocalData):
+            return SyncTextConflictResolution(
+                resolvedText: currentLocalText,
+                baseText: conflict.remoteText,
+                resolvedData: currentLocalData,
+                usesRemoteData: false
+            )
+
+        case .acceptIncoming:
+            return SyncTextConflictResolution(
+                resolvedText: conflict.remoteText,
+                baseText: conflict.localText,
+                resolvedData: conflict.remoteData,
+                usesRemoteData: true
+            )
+        }
+    }
+}
+
 public extension SyncTextConflictVersion {
     func perspectiveForPeerPreservedConflict(currentLocalText: String) -> SyncTextConflictPerspective {
         if localText == remoteText {
@@ -309,6 +358,20 @@ public extension SyncTextConflictVersion {
             remoteUpdatedAt: remoteUpdatedAt ?? preservedAt,
             preservedAt: preservedAt,
             expiresAt: expiresAt
+        )
+    }
+
+    func resolutionKeepingLocal(currentLocalText: String) -> SyncTextConflictResolution {
+        SyncTextConflictResolver.resolve(
+            self,
+            choice: .keepLocal(currentLocalText: currentLocalText)
+        )
+    }
+
+    func resolutionAcceptingIncoming() -> SyncTextConflictResolution {
+        SyncTextConflictResolver.resolve(
+            self,
+            choice: .acceptIncoming
         )
     }
 }

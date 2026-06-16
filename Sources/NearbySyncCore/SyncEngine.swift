@@ -64,7 +64,7 @@ public final class SyncEngine: @unchecked Sendable {
             acknowledgedLocalChanges: acknowledgedLocalChanges
         )
 
-        for change in envelope.changes {
+        for change in envelope.changes.sorted(by: syncApplyOrder) {
             if await queue.hasApplied(change.id) {
                 result.ignoredDuplicateIDs.append(change.id)
                 continue
@@ -87,6 +87,13 @@ public final class SyncEngine: @unchecked Sendable {
         return result
     }
 
+    private func syncApplyOrder(_ lhs: SyncChange, _ rhs: SyncChange) -> Bool {
+        if lhs.isResolvedConflictMetadata != rhs.isResolvedConflictMetadata {
+            return lhs.isResolvedConflictMetadata
+        }
+        return lhs.updatedAt < rhs.updatedAt
+    }
+
     public func markAcknowledgementSent(_ changeIDs: [UUID]) async {
         await queue.markAcknowledgementSent(changeIDs)
     }
@@ -101,5 +108,15 @@ public final class SyncEngine: @unchecked Sendable {
 
     public func record(for entityType: SyncEntityType, entityID: String) async -> SyncRecord? {
         await store.record(for: entityType, entityID: entityID)
+    }
+}
+
+private extension SyncChange {
+    var isResolvedConflictMetadata: Bool {
+        guard entityType == .conflict,
+              let payload = try? SyncTextConflictPayload.decode(from: payload) else {
+            return false
+        }
+        return payload.action == .resolved
     }
 }
