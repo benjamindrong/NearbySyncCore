@@ -57,6 +57,7 @@ public actor InMemorySyncStore: SyncStore {
 public actor LocalFirstTextSyncStore: SyncStore {
     private let localDeviceID: String
     private let conflictStore: SyncTextConflictStore
+    private let textApplicationGate: SyncTextApplicationGate
     private var records: [RecordKey: SyncRecord] = [:]
     private var remoteBaselines: [RecordKey: SyncRecord] = [:]
     private var pendingLocalTextBaselines: [RecordKey: PendingTextBaseline] = [:]
@@ -65,10 +66,12 @@ public actor LocalFirstTextSyncStore: SyncStore {
     public init(
         localDeviceID: String,
         conflictStore: SyncTextConflictStore,
+        textApplicationGate: @escaping SyncTextApplicationGate = { _ in .allowAutomaticApply },
         seedRecords: [SyncRecord] = []
     ) {
         self.localDeviceID = localDeviceID
         self.conflictStore = conflictStore
+        self.textApplicationGate = textApplicationGate
         for record in seedRecords {
             records[RecordKey(type: record.entityType, id: record.entityID)] = record
         }
@@ -264,14 +267,43 @@ public actor LocalFirstTextSyncStore: SyncStore {
 
     private func incomingTextResolution(existing: SyncRecord, change: SyncChange) -> IncomingTextResolution {
         let key = RecordKey(type: change.entityType, id: change.entityID)
+        let fieldID = "text"
         let localText = String(data: existing.payload, encoding: .utf8) ?? ""
         let incomingPayload = SyncTextPayload.decodeText(from: change.payload)
         let remoteText = incomingPayload.text
         let baselineText = incomingPayload.baseText
             ?? remoteBaselines[key].flatMap { String(data: $0.payload, encoding: .utf8) }
 
+        let context = SyncTextApplicationContext(
+            entityType: change.entityType,
+            entityID: change.entityID,
+            fieldID: fieldID,
+            localText: localText,
+            remoteText: remoteText,
+            baseText: baselineText,
+            remoteUpdatedAt: change.updatedAt
+        )
+
+        if conflictStore.hasActiveConflict(entityType: change.entityType, entityID: change.entityID, fieldID: fieldID) {
+            return preserveIncomingText(
+                change: change,
+                fieldID: fieldID,
+                localText: localText,
+                remoteText: remoteText
+            )
+        }
+
         switch SyncThreeWayTextMergePolicy.merge(base: baselineText, local: localText, remote: remoteText) {
         case .apply(let remoteText), .merged(let remoteText):
+            if remoteText != localText,
+               textApplicationGate(context) == .preserveForReview {
+                return preserveIncomingText(
+                    change: change,
+                    fieldID: fieldID,
+                    localText: localText,
+                    remoteText: remoteText
+                )
+            }
             return .store(remoteText)
         case .noOp:
             return .store(localText)
@@ -279,18 +311,41 @@ public actor LocalFirstTextSyncStore: SyncStore {
             break
         }
 
+        return preserveIncomingText(
+            change: change,
+            fieldID: fieldID,
+            localText: localText,
+            remoteText: remoteText
+        )
+    }
+
+    private func preserveIncomingText(
+        change: SyncChange,
+        fieldID: String,
+        localText: String,
+        remoteText: String
+    ) -> IncomingTextResolution {
         guard let conflict = SyncTextConflictPolicy.conflictIfTextDiverged(
             entityType: change.entityType,
             entityID: change.entityID,
-            fieldID: "text",
+            fieldID: fieldID,
             remoteOperation: change.operation,
             localText: localText,
             remoteText: remoteText,
             remoteUpdatedAt: change.updatedAt
         ) else { return .store(localText) }
 
-        _ = conflictStore.preserve(conflict)
+        let conflictsBeforePreserve = conflictStore.activeConflicts()
+        let conflicts = conflictStore.preserve(conflict)
         lastPreservedConflicts = [conflict]
+        if conflicts == conflictsBeforePreserve,
+           conflictStore.queuedConflict(
+                entityType: change.entityType,
+                entityID: change.entityID,
+                fieldID: fieldID
+           ) != nil {
+            lastPreservedConflicts = []
+        }
         return .conflict
     }
 }
