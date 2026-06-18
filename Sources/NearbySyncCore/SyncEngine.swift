@@ -27,8 +27,10 @@ public final class SyncEngine: @unchecked Sendable {
             originDeviceID: deviceID
         )
 
-        _ = await store.apply(change)
-        await queue.enqueue(change)
+        let didApply = await store.apply(change)
+        if didApply {
+            await queue.enqueue(change)
+        }
         return change
     }
 

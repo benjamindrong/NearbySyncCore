@@ -89,8 +89,14 @@ public actor LocalFirstTextSyncStore: SyncStore {
         }
 
         let key = RecordKey(type: change.entityType, id: change.entityID)
+        let fieldID = "text"
 
         if let existing = records[key], existing.updatedAt > change.updatedAt {
+            return false
+        }
+
+        if change.originDeviceID == localDeviceID,
+           conflictStore.hasActiveConflict(entityType: change.entityType, entityID: change.entityID, fieldID: fieldID) {
             return false
         }
 

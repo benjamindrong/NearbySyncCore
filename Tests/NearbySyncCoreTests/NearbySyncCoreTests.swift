@@ -385,6 +385,53 @@ final class NearbySyncCoreTests: XCTestCase {
         XCTAssertNil(conflictStore.queuedConflict(entityType: .item, entityID: "item-1", fieldID: "text"))
     }
 
+    func testLocalFirstTextStoreBlocksOutgoingLocalTextWhileConflictIsActive() async throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let store = LocalFirstTextSyncStore(
+            localDeviceID: "device-a",
+            conflictStore: conflictStore,
+            seedRecords: [
+                SyncRecord(
+                    entityType: .item,
+                    entityID: "item-1",
+                    payload: Data("local note".utf8),
+                    updatedAt: Date(timeIntervalSince1970: 100)
+                )
+            ]
+        )
+        let engine = SyncEngine(deviceID: "device-a", store: store)
+        let expiresAt = Date().addingTimeInterval(1_000)
+        let conflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "local note",
+            remoteText: "Version to Sync",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            expiresAt: expiresAt
+        )
+        _ = conflictStore.preserve(conflict)
+
+        _ = await engine.recordLocalChange(
+            entityType: .item,
+            entityID: "item-1",
+            payload: try SyncTextPayload(text: "typed during review", baseText: "local note").encoded(),
+            updatedAt: Date(timeIntervalSince1970: 250)
+        )
+
+        let record = await store.record(for: .item, entityID: "item-1")
+        let envelope = await engine.nextEnvelope()
+        let pendingCount = await engine.pendingChangeCount()
+        XCTAssertEqual(record?.payload, Data("local note".utf8))
+        XCTAssertNil(envelope)
+        XCTAssertEqual(pendingCount, 0)
+        XCTAssertEqual(conflictStore.activeConflicts(now: Date(timeIntervalSince1970: 251)).first, conflict)
+    }
+
     func testThreeWayTextMergeConflictsSameSpotOfflineEdits() {
         let result = SyncThreeWayTextMergePolicy.merge(
             base: "Need milk",
