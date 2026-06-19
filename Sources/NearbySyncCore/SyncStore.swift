@@ -59,7 +59,7 @@ public actor LocalFirstTextSyncStore: SyncStore {
     private let conflictStore: SyncTextConflictStore
     private let textApplicationGate: SyncTextApplicationGate
     private var records: [RecordKey: SyncRecord] = [:]
-    private var remoteBaselines: [RecordKey: SyncRecord] = [:]
+    private var remoteBaselines: [RecordKey: RemoteTextBaseline] = [:]
     private var pendingLocalTextBaselines: [RecordKey: PendingTextBaseline] = [:]
     private var lastPreservedConflicts: [SyncTextConflictVersion] = []
 
@@ -120,7 +120,7 @@ public actor LocalFirstTextSyncStore: SyncStore {
         )
         records[key] = record
         if change.originDeviceID != localDeviceID {
-            remoteBaselines[key] = record
+            remoteBaselines[key] = RemoteTextBaseline(record: record, originDeviceID: change.originDeviceID)
             pendingLocalTextBaselines.removeValue(forKey: key)
         }
         return true
@@ -145,7 +145,7 @@ public actor LocalFirstTextSyncStore: SyncStore {
         if let pendingBaseline = pendingLocalTextBaselines[key] {
             baseline = pendingBaseline
         } else {
-            let baselineText = remoteBaselines[key].flatMap { String(data: $0.payload, encoding: .utf8) }
+            let baselineText = remoteBaselines[key].flatMap { String(data: $0.record.payload, encoding: .utf8) }
                 ?? records[key].flatMap { String(data: $0.payload, encoding: .utf8) }
             baseline = PendingTextBaseline(text: baselineText)
             pendingLocalTextBaselines[key] = baseline
@@ -172,7 +172,7 @@ public actor LocalFirstTextSyncStore: SyncStore {
             // shared state. The next local edit should diff from this text, but
             // all collapsed offline edits before acknowledgement keep the older
             // base so they cannot merge against a previous keystroke.
-            remoteBaselines[key] = record
+            remoteBaselines[key] = RemoteTextBaseline(record: record, originDeviceID: localDeviceID)
             pendingLocalTextBaselines.removeValue(forKey: key)
         }
     }
@@ -194,13 +194,14 @@ public actor LocalFirstTextSyncStore: SyncStore {
             updatedAt: Date(),
             isDeleted: false
         )
-        remoteBaselines[key] = SyncRecord(
+        let record = SyncRecord(
             entityType: conflict.entityType,
             entityID: conflict.entityID,
             payload: Data(conflict.remoteText.utf8),
             updatedAt: conflict.remoteUpdatedAt,
             isDeleted: false
         )
+        remoteBaselines[key] = RemoteTextBaseline(record: record, originDeviceID: nil)
         return conflictStore.removeResolvedConflict(conflict)
     }
 
@@ -252,7 +253,7 @@ public actor LocalFirstTextSyncStore: SyncStore {
                 isDeleted: false
             )
             records[key] = record
-            remoteBaselines[key] = record
+            remoteBaselines[key] = RemoteTextBaseline(record: record, originDeviceID: nil)
             return true
         case .noOp:
             _ = conflictStore.removeConflict(id: conflict.id)
@@ -266,7 +267,7 @@ public actor LocalFirstTextSyncStore: SyncStore {
                 isDeleted: false
             )
             records[key] = record
-            remoteBaselines[key] = record
+            remoteBaselines[key] = RemoteTextBaseline(record: record, originDeviceID: nil)
             return true
         }
     }
@@ -277,8 +278,17 @@ public actor LocalFirstTextSyncStore: SyncStore {
         let localText = String(data: existing.payload, encoding: .utf8) ?? ""
         let incomingPayload = SyncTextPayload.decodeText(from: change.payload)
         let remoteText = incomingPayload.text
-        let baselineText = incomingPayload.baseText
-            ?? remoteBaselines[key].flatMap { String(data: $0.payload, encoding: .utf8) }
+        let trackedBaseline = remoteBaselines[key]
+        let baselineText: String?
+        if trackedBaseline?.originDeviceID == change.originDeviceID {
+            // Same-peer edit bursts can carry a base from before the burst was
+            // acknowledged. Use the receiver's applied same-peer baseline so
+            // delete/retype churn is treated as continuation, not divergence.
+            baselineText = trackedBaseline.flatMap { String(data: $0.record.payload, encoding: .utf8) }
+        } else {
+            baselineText = incomingPayload.baseText
+                ?? trackedBaseline.flatMap { String(data: $0.record.payload, encoding: .utf8) }
+        }
 
         let context = SyncTextApplicationContext(
             entityType: change.entityType,
@@ -363,6 +373,11 @@ private enum IncomingTextResolution {
 
 private struct PendingTextBaseline {
     let text: String?
+}
+
+private struct RemoteTextBaseline {
+    let record: SyncRecord
+    let originDeviceID: String?
 }
 
 private struct RecordKey: Hashable {
