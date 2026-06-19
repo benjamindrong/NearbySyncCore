@@ -347,6 +347,47 @@ final class NearbySyncCoreTests: XCTestCase {
         XCTAssertTrue(conflicts.isEmpty)
     }
 
+    func testLocalFirstTextStorePreservesRemoteTextWhenGateBlocksAutomaticApply() async throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let store = LocalFirstTextSyncStore(
+            localDeviceID: "device-a",
+            conflictStore: conflictStore,
+            textApplicationGate: { _ in .preserveForReview },
+            seedRecords: [
+                SyncRecord(
+                    entityType: .item,
+                    entityID: "item-1",
+                    payload: Data("local typing".utf8),
+                    updatedAt: Date(timeIntervalSince1970: 100)
+                )
+            ]
+        )
+        let engine = SyncEngine(deviceID: "device-a", store: store)
+        let payload = try SyncTextPayload(text: "", baseText: "local typing").encoded()
+        let change = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: payload,
+            updatedAt: Date(timeIntervalSince1970: 200),
+            originDeviceID: "device-b"
+        )
+
+        let result = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-b", changes: [change]))
+
+        let record = await store.record(for: .item, entityID: "item-1")
+        let conflicts = await store.activeConflicts(now: Date(timeIntervalSince1970: 201))
+        XCTAssertEqual(record?.payload, Data("local typing".utf8))
+        XCTAssertEqual(result.ignoredStaleIDs, [change.id])
+        XCTAssertEqual(result.preservedConflicts.first?.localText, "local typing")
+        XCTAssertEqual(result.preservedConflicts.first?.remoteText, "")
+        XCTAssertEqual(conflicts.first?.remoteText, "")
+    }
+
     func testCleanRemoteTextEditAfterAcknowledgedBaseAppliesWithoutConflict() async throws {
         let conflictURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -374,7 +415,8 @@ final class NearbySyncCoreTests: XCTestCase {
             payload: createPayload,
             updatedAt: Date(timeIntervalSince1970: 100)
         )
-        let createEnvelope = try XCTUnwrap(await sender.nextEnvelope())
+        let pendingCreateEnvelope = await sender.nextEnvelope()
+        let createEnvelope = try XCTUnwrap(pendingCreateEnvelope)
         _ = await receiver.applyIncomingEnvelope(createEnvelope)
         await sender.acknowledgeChanges([create.id])
 
@@ -389,7 +431,8 @@ final class NearbySyncCoreTests: XCTestCase {
             payload: editPayload,
             updatedAt: Date(timeIntervalSince1970: 200)
         )
-        let editEnvelope = try XCTUnwrap(await sender.nextEnvelope())
+        let pendingEditEnvelope = await sender.nextEnvelope()
+        let editEnvelope = try XCTUnwrap(pendingEditEnvelope)
         let result = await receiver.applyIncomingEnvelope(editEnvelope)
 
         let record = await receiverStore.record(for: .item, entityID: "note-1")
@@ -397,6 +440,115 @@ final class NearbySyncCoreTests: XCTestCase {
         XCTAssertEqual(result.appliedChangeIDs, [edit.id])
         XCTAssertEqual(record?.payload, Data("edited".utf8))
         XCTAssertTrue(conflicts.isEmpty)
+    }
+
+    func testLocalFirstTextStoreQueuesLaterUpdatesForConflictedFieldOnly() async throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let store = LocalFirstTextSyncStore(
+            localDeviceID: "device-a",
+            conflictStore: conflictStore,
+            seedRecords: [
+                SyncRecord(
+                    entityType: .item,
+                    entityID: "item-1",
+                    payload: Data("local note".utf8),
+                    updatedAt: Date(timeIntervalSince1970: 100)
+                )
+            ]
+        )
+        let engine = SyncEngine(deviceID: "device-a", store: store)
+        let first = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: try SyncTextPayload(text: "remote note", baseText: nil).encoded(),
+            updatedAt: Date(timeIntervalSince1970: 200),
+            originDeviceID: "device-b"
+        )
+        let second = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: try SyncTextPayload(text: "latest remote note", baseText: nil).encoded(),
+            updatedAt: Date(timeIntervalSince1970: 250),
+            originDeviceID: "device-b"
+        )
+        let unrelated = SyncChange(
+            entityType: .item,
+            entityID: "item-2",
+            operation: .upsert,
+            payload: try SyncTextPayload(text: "new unrelated note", baseText: nil).encoded(),
+            updatedAt: Date(timeIntervalSince1970: 260),
+            originDeviceID: "device-b"
+        )
+
+        _ = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-b", changes: [first]))
+        let result = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-b", changes: [second, unrelated]))
+
+        let conflictedRecord = await store.record(for: .item, entityID: "item-1")
+        let unrelatedRecord = await store.record(for: .item, entityID: "item-2")
+        let activeConflicts = await store.activeConflicts(now: Date(timeIntervalSince1970: 270))
+        let queuedConflict = conflictStore.queuedConflict(entityType: .item, entityID: "item-1", fieldID: "text")
+        XCTAssertEqual(conflictedRecord?.payload, Data("local note".utf8))
+        XCTAssertEqual(unrelatedRecord?.payload, Data("new unrelated note".utf8))
+        XCTAssertEqual(result.appliedChangeIDs, [unrelated.id])
+        XCTAssertEqual(activeConflicts.first?.remoteText, "remote note")
+        XCTAssertEqual(queuedConflict?.conflict.remoteText, "latest remote note")
+
+        let conflictsAfterResolution = conflictStore.removeResolvedConflict(try XCTUnwrap(activeConflicts.first))
+        XCTAssertTrue(conflictsAfterResolution.isEmpty)
+        XCTAssertNil(conflictStore.queuedConflict(entityType: .item, entityID: "item-1", fieldID: "text"))
+    }
+
+    func testLocalFirstTextStoreBlocksOutgoingLocalTextWhileConflictIsActive() async throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let store = LocalFirstTextSyncStore(
+            localDeviceID: "device-a",
+            conflictStore: conflictStore,
+            seedRecords: [
+                SyncRecord(
+                    entityType: .item,
+                    entityID: "item-1",
+                    payload: Data("local note".utf8),
+                    updatedAt: Date(timeIntervalSince1970: 100)
+                )
+            ]
+        )
+        let engine = SyncEngine(deviceID: "device-a", store: store)
+        let expiresAt = Date().addingTimeInterval(1_000)
+        let conflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "local note",
+            remoteText: "Version to Sync",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            expiresAt: expiresAt
+        )
+        _ = conflictStore.preserve(conflict)
+
+        _ = await engine.recordLocalChange(
+            entityType: .item,
+            entityID: "item-1",
+            payload: try SyncTextPayload(text: "typed during review", baseText: "local note").encoded(),
+            updatedAt: Date(timeIntervalSince1970: 250)
+        )
+
+        let record = await store.record(for: .item, entityID: "item-1")
+        let envelope = await engine.nextEnvelope()
+        let pendingCount = await engine.pendingChangeCount()
+        XCTAssertEqual(record?.payload, Data("local note".utf8))
+        XCTAssertNil(envelope)
+        XCTAssertEqual(pendingCount, 0)
+        XCTAssertEqual(conflictStore.activeConflicts(now: Date(timeIntervalSince1970: 251)).first, conflict)
     }
 
     func testThreeWayTextMergeConflictsSameSpotOfflineEdits() {
@@ -494,6 +646,481 @@ final class NearbySyncCoreTests: XCTestCase {
         let decodedPayload = SyncTextPayload.decodeText(from: secondPayload)
         XCTAssertEqual(decodedPayload.baseText, "first synced")
         XCTAssertEqual(decodedPayload.text, "second synced")
+    }
+
+    // MYR-81: a sender can emit several debounced local edits before the first
+    // one is acknowledged, so later edits in the same burst still carry the
+    // base from before the burst started. The receiver can safely prefer its
+    // own tracked baseline only for same-sender continuations; doing that for
+    // a different sender can hide real remote divergence.
+
+    func testRapidLocalTypingFromPeerDoesNotCreateFalseConflict() async throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let store = LocalFirstTextSyncStore(
+            localDeviceID: "device-b",
+            conflictStore: SyncTextConflictStore(fileURL: conflictURL),
+            seedRecords: [
+                SyncRecord(
+                    entityType: .item,
+                    entityID: "item-1",
+                    payload: Data("".utf8),
+                    updatedAt: Date(timeIntervalSince1970: 100)
+                )
+            ]
+        )
+        let engine = SyncEngine(deviceID: "device-b", store: store)
+        let firstKeystrokeBurst = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: try SyncTextPayload(text: "hello", baseText: "").encoded(),
+            updatedAt: Date(timeIntervalSince1970: 200),
+            originDeviceID: "device-a"
+        )
+        let secondKeystrokeBurst = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: try SyncTextPayload(text: "hello world", baseText: "").encoded(),
+            updatedAt: Date(timeIntervalSince1970: 210),
+            originDeviceID: "device-a"
+        )
+
+        _ = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-a", changes: [firstKeystrokeBurst]))
+        let result = await engine.applyIncomingEnvelope(
+            SyncEnvelope(senderDeviceID: "device-a", changes: [secondKeystrokeBurst])
+        )
+
+        let record = await store.record(for: .item, entityID: "item-1")
+        let conflicts = await store.activeConflicts(now: Date(timeIntervalSince1970: 211))
+        XCTAssertEqual(record?.payload, Data("hello world".utf8))
+        XCTAssertEqual(result.appliedChangeIDs, [secondKeystrokeBurst.id])
+        XCTAssertTrue(conflicts.isEmpty)
+    }
+
+    func testRapidLocalTypoCorrectionFromPeerDoesNotCreateFalseConflict() async throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let store = LocalFirstTextSyncStore(
+            localDeviceID: "device-b",
+            conflictStore: SyncTextConflictStore(fileURL: conflictURL),
+            seedRecords: [
+                SyncRecord(
+                    entityType: .item,
+                    entityID: "item-1",
+                    payload: Data("Hello".utf8),
+                    updatedAt: Date(timeIntervalSince1970: 100)
+                )
+            ]
+        )
+        let engine = SyncEngine(deviceID: "device-b", store: store)
+        // Sender typed a typo and sent it before noticing.
+        let typo = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: try SyncTextPayload(text: "Helllo World", baseText: "Hello").encoded(),
+            updatedAt: Date(timeIntervalSince1970: 200),
+            originDeviceID: "device-a"
+        )
+        // Sender deletes the extra letter and resends before the typo edit is acknowledged.
+        let correction = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: try SyncTextPayload(text: "Hello World", baseText: "Hello").encoded(),
+            updatedAt: Date(timeIntervalSince1970: 210),
+            originDeviceID: "device-a"
+        )
+
+        _ = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-a", changes: [typo]))
+        let result = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-a", changes: [correction]))
+
+        let record = await store.record(for: .item, entityID: "item-1")
+        let conflicts = await store.activeConflicts(now: Date(timeIntervalSince1970: 211))
+        XCTAssertEqual(record?.payload, Data("Hello World".utf8))
+        XCTAssertEqual(result.appliedChangeIDs, [correction.id])
+        XCTAssertTrue(conflicts.isEmpty)
+    }
+
+    func testRapidLocalDeletionFromPeerDoesNotCreateFalseConflict() async throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let store = LocalFirstTextSyncStore(
+            localDeviceID: "device-b",
+            conflictStore: SyncTextConflictStore(fileURL: conflictURL),
+            seedRecords: [
+                SyncRecord(
+                    entityType: .item,
+                    entityID: "item-1",
+                    payload: Data("alpha beta gamma delta".utf8),
+                    updatedAt: Date(timeIntervalSince1970: 100)
+                )
+            ]
+        )
+        let engine = SyncEngine(deviceID: "device-b", store: store)
+        let firstDelete = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: try SyncTextPayload(text: "alpha beta gamma", baseText: "alpha beta gamma delta").encoded(),
+            updatedAt: Date(timeIntervalSince1970: 200),
+            originDeviceID: "device-a"
+        )
+        let secondDelete = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: try SyncTextPayload(text: "alpha beta", baseText: "alpha beta gamma delta").encoded(),
+            updatedAt: Date(timeIntervalSince1970: 210),
+            originDeviceID: "device-a"
+        )
+
+        _ = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-a", changes: [firstDelete]))
+        let result = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-a", changes: [secondDelete]))
+
+        let record = await store.record(for: .item, entityID: "item-1")
+        let conflicts = await store.activeConflicts(now: Date(timeIntervalSince1970: 211))
+        XCTAssertEqual(record?.payload, Data("alpha beta".utf8))
+        XCTAssertEqual(result.appliedChangeIDs, [secondDelete.id])
+        XCTAssertTrue(conflicts.isEmpty)
+    }
+
+    func testRapidDeleteThenAddBackFromPeerDoesNotCreateFalseConflict() async throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let store = LocalFirstTextSyncStore(
+            localDeviceID: "device-b",
+            conflictStore: SyncTextConflictStore(fileURL: conflictURL),
+            seedRecords: [
+                SyncRecord(
+                    entityType: .item,
+                    entityID: "item-1",
+                    payload: Data("alpha beta gamma".utf8),
+                    updatedAt: Date(timeIntervalSince1970: 100)
+                )
+            ]
+        )
+        let engine = SyncEngine(deviceID: "device-b", store: store)
+        let deletion = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: try SyncTextPayload(text: "alpha gamma", baseText: "alpha beta gamma").encoded(),
+            updatedAt: Date(timeIntervalSince1970: 200),
+            originDeviceID: "device-a"
+        )
+        let replacement = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: try SyncTextPayload(text: "alpha better gamma", baseText: "alpha beta gamma").encoded(),
+            updatedAt: Date(timeIntervalSince1970: 210),
+            originDeviceID: "device-a"
+        )
+
+        _ = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-a", changes: [deletion]))
+        let result = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-a", changes: [replacement]))
+
+        let record = await store.record(for: .item, entityID: "item-1")
+        let conflicts = await store.activeConflicts(now: Date(timeIntervalSince1970: 211))
+        XCTAssertEqual(record?.payload, Data("alpha better gamma".utf8))
+        XCTAssertEqual(result.appliedChangeIDs, [replacement.id])
+        XCTAssertTrue(conflicts.isEmpty)
+    }
+
+    func testRapidSameRangeAutocorrectFromPeerDoesNotCreateFalseConflict() async throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let store = LocalFirstTextSyncStore(
+            localDeviceID: "device-b",
+            conflictStore: SyncTextConflictStore(fileURL: conflictURL),
+            seedRecords: [
+                SyncRecord(
+                    entityType: .item,
+                    entityID: "item-1",
+                    payload: Data("I went tehre".utf8),
+                    updatedAt: Date(timeIntervalSince1970: 100)
+                )
+            ]
+        )
+        let engine = SyncEngine(deviceID: "device-b", store: store)
+        let autocorrect = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: try SyncTextPayload(text: "I went there", baseText: "I went tehre").encoded(),
+            updatedAt: Date(timeIntervalSince1970: 200),
+            originDeviceID: "device-a"
+        )
+        let continuation = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: try SyncTextPayload(text: "I went there today", baseText: "I went tehre").encoded(),
+            updatedAt: Date(timeIntervalSince1970: 210),
+            originDeviceID: "device-a"
+        )
+
+        _ = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-a", changes: [autocorrect]))
+        let result = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-a", changes: [continuation]))
+
+        let record = await store.record(for: .item, entityID: "item-1")
+        let conflicts = await store.activeConflicts(now: Date(timeIntervalSince1970: 211))
+        XCTAssertEqual(record?.payload, Data("I went there today".utf8))
+        XCTAssertEqual(result.appliedChangeIDs, [continuation.id])
+        XCTAssertTrue(conflicts.isEmpty)
+    }
+
+    func testRapidNewlineHeavyEditsFromPeerDoNotCreateFalseConflict() async throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let store = LocalFirstTextSyncStore(
+            localDeviceID: "device-b",
+            conflictStore: SyncTextConflictStore(fileURL: conflictURL),
+            seedRecords: [
+                SyncRecord(
+                    entityType: .item,
+                    entityID: "item-1",
+                    payload: Data("Notes:".utf8),
+                    updatedAt: Date(timeIntervalSince1970: 100)
+                )
+            ]
+        )
+        let engine = SyncEngine(deviceID: "device-b", store: store)
+        let firstLine = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: try SyncTextPayload(text: "Notes:\nitem1", baseText: "Notes:").encoded(),
+            updatedAt: Date(timeIntervalSince1970: 200),
+            originDeviceID: "device-a"
+        )
+        let moreLines = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: try SyncTextPayload(text: "Notes:\nitem1\nitem2\nitem3", baseText: "Notes:").encoded(),
+            updatedAt: Date(timeIntervalSince1970: 210),
+            originDeviceID: "device-a"
+        )
+
+        _ = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-a", changes: [firstLine]))
+        let result = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-a", changes: [moreLines]))
+
+        let record = await store.record(for: .item, entityID: "item-1")
+        let conflicts = await store.activeConflicts(now: Date(timeIntervalSince1970: 211))
+        XCTAssertEqual(record?.payload, Data("Notes:\nitem1\nitem2\nitem3".utf8))
+        XCTAssertEqual(result.appliedChangeIDs, [moreLines.id])
+        XCTAssertTrue(conflicts.isEmpty)
+    }
+
+    func testGenuineTwoDeviceDivergenceFromSameBaseStillConflicts() async throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let store = LocalFirstTextSyncStore(
+            localDeviceID: "device-b",
+            conflictStore: SyncTextConflictStore(fileURL: conflictURL)
+        )
+        let engine = SyncEngine(deviceID: "device-b", store: store)
+        let originalRemoteChange = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: try SyncTextPayload(text: "Hello", baseText: nil).encoded(),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            originDeviceID: "device-a"
+        )
+        _ = await engine.applyIncomingEnvelope(
+            SyncEnvelope(senderDeviceID: "device-a", changes: [originalRemoteChange])
+        )
+        // device-b makes a genuine local edit device-a does not know about yet.
+        _ = await engine.recordLocalChange(
+            entityType: .item,
+            entityID: "item-1",
+            payload: Data("Hello there".utf8),
+            updatedAt: Date(timeIntervalSince1970: 150)
+        )
+        // device-a independently edits from the same shared base.
+        let divergentRemoteChange = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: try SyncTextPayload(text: "Hello World", baseText: "Hello").encoded(),
+            updatedAt: Date(timeIntervalSince1970: 200),
+            originDeviceID: "device-a"
+        )
+
+        let result = await engine.applyIncomingEnvelope(
+            SyncEnvelope(senderDeviceID: "device-a", changes: [divergentRemoteChange])
+        )
+
+        let record = await store.record(for: .item, entityID: "item-1")
+        let conflicts = await store.activeConflicts(now: Date(timeIntervalSince1970: 201))
+        XCTAssertEqual(record?.payload, Data("Hello there".utf8))
+        XCTAssertEqual(result.ignoredStaleIDs, [divergentRemoteChange.id])
+        XCTAssertEqual(conflicts.first?.localText, "Hello there")
+        XCTAssertEqual(conflicts.first?.remoteText, "Hello World")
+    }
+
+    func testDifferentRemoteSenderStaleBaseDoesNotOverwriteTrackedText() async throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let store = LocalFirstTextSyncStore(
+            localDeviceID: "device-b",
+            conflictStore: SyncTextConflictStore(fileURL: conflictURL)
+        )
+        let engine = SyncEngine(deviceID: "device-b", store: store)
+        let firstSharedText = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: try SyncTextPayload(text: "Hello", baseText: nil).encoded(),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            originDeviceID: "device-a"
+        )
+        let deviceCEdit = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: try SyncTextPayload(text: "Hello from C", baseText: "Hello").encoded(),
+            updatedAt: Date(timeIntervalSince1970: 200),
+            originDeviceID: "device-c"
+        )
+        let staleDeviceAEdit = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: try SyncTextPayload(text: "Hello from A", baseText: "Hello").encoded(),
+            updatedAt: Date(timeIntervalSince1970: 210),
+            originDeviceID: "device-a"
+        )
+
+        _ = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-a", changes: [firstSharedText]))
+        _ = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-c", changes: [deviceCEdit]))
+        let result = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-a", changes: [staleDeviceAEdit]))
+
+        let record = await store.record(for: .item, entityID: "item-1")
+        let conflicts = await store.activeConflicts(now: Date(timeIntervalSince1970: 211))
+        XCTAssertEqual(record?.payload, Data("Hello from C".utf8))
+        XCTAssertEqual(result.ignoredStaleIDs, [staleDeviceAEdit.id])
+        XCTAssertEqual(conflicts.first?.localText, "Hello from C")
+        XCTAssertEqual(conflicts.first?.remoteText, "Hello from A")
+    }
+
+    func testActiveConflictPreventsRemoteOrdinaryTextFromOverwritingLocalText() async throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let store = LocalFirstTextSyncStore(
+            localDeviceID: "device-b",
+            conflictStore: conflictStore,
+            seedRecords: [
+                SyncRecord(
+                    entityType: .item,
+                    entityID: "item-1",
+                    payload: Data("local editor text".utf8),
+                    updatedAt: Date(timeIntervalSince1970: 200)
+                )
+            ]
+        )
+        let engine = SyncEngine(deviceID: "device-b", store: store)
+        let expiresAt = Date().addingTimeInterval(1_000)
+        let existingConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "local editor text",
+            remoteText: "remote conflicting text",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 190),
+            preservedAt: Date(timeIntervalSince1970: 190),
+            expiresAt: expiresAt
+        )
+        _ = conflictStore.preserve(existingConflict)
+        let staleRemoteText = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: try SyncTextPayload(text: "stale remote replacement", baseText: "shared text").encoded(),
+            updatedAt: Date(timeIntervalSince1970: 210),
+            originDeviceID: "device-a"
+        )
+
+        let result = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-a", changes: [staleRemoteText]))
+
+        let record = await store.record(for: .item, entityID: "item-1")
+        let conflicts = await store.activeConflicts(now: Date(timeIntervalSince1970: 211))
+        XCTAssertEqual(record?.payload, Data("local editor text".utf8))
+        XCTAssertEqual(result.ignoredStaleIDs, [staleRemoteText.id])
+        XCTAssertEqual(conflicts.first?.localText, "local editor text")
+    }
+
+    func testActiveConflictPreservesLocalDeleteThenRetypeAgainstRemoteOrdinaryText() async throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let store = LocalFirstTextSyncStore(
+            localDeviceID: "device-b",
+            conflictStore: conflictStore,
+            seedRecords: [
+                SyncRecord(
+                    entityType: .item,
+                    entityID: "item-1",
+                    payload: Data("local corrected text after retyping".utf8),
+                    updatedAt: Date(timeIntervalSince1970: 220)
+                )
+            ]
+        )
+        let engine = SyncEngine(deviceID: "device-b", store: store)
+        let expiresAt = Date().addingTimeInterval(1_000)
+        let existingConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "local text before correction",
+            remoteText: "remote conflicting text",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 190),
+            preservedAt: Date(timeIntervalSince1970: 190),
+            expiresAt: expiresAt
+        )
+        _ = conflictStore.preserve(existingConflict)
+        let staleRemoteText = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: try SyncTextPayload(text: "remote text while reviewing", baseText: "shared text").encoded(),
+            updatedAt: Date(timeIntervalSince1970: 230),
+            originDeviceID: "device-a"
+        )
+
+        let result = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-a", changes: [staleRemoteText]))
+
+        let record = await store.record(for: .item, entityID: "item-1")
+        let queuedConflict = conflictStore.queuedConflict(entityType: .item, entityID: "item-1", fieldID: "text")
+        XCTAssertEqual(record?.payload, Data("local corrected text after retyping".utf8))
+        XCTAssertEqual(result.ignoredStaleIDs, [staleRemoteText.id])
+        XCTAssertEqual(queuedConflict?.conflict.localText, "local corrected text after retyping")
     }
 
     func testLocalFirstConflictResolutionActionsDoNotQueueChanges() async {
@@ -707,9 +1334,11 @@ final class NearbySyncCoreTests: XCTestCase {
 
         _ = conflictStore.preserve(firstConflict)
         let conflicts = conflictStore.preserve(duplicateConflict)
+        let queuedConflict = conflictStore.queuedConflict(entityType: .item, entityID: "item-1", fieldID: "text")
 
         XCTAssertEqual(conflicts.count, 1)
-        XCTAssertEqual(conflicts.first?.remoteText, "iPhone incoming again")
+        XCTAssertEqual(conflicts.first?.remoteText, "iPhone incoming")
+        XCTAssertEqual(queuedConflict?.conflict.remoteText, "iPhone incoming again")
     }
 
     func testRemovingResolvedConflictClearsDuplicateEntityFieldConflicts() {
@@ -829,7 +1458,7 @@ final class NearbySyncCoreTests: XCTestCase {
         XCTAssertEqual(normalized.remoteUpdatedAt, conflict.preservedAt)
     }
 
-    func testResolvedConflictPayloadPreservesConflictWhenPeerDivergedFromBase() async throws {
+    func testResolvedConflictPayloadAppliesWinnerWhenPeerDivergedFromBase() async throws {
         let conflictURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
             .appendingPathComponent("sync-conflicts.json")
@@ -876,10 +1505,9 @@ final class NearbySyncCoreTests: XCTestCase {
 
         let record = await store.record(for: .item, entityID: "item-1")
         let conflicts = await store.activeConflicts(now: Date(timeIntervalSince1970: 301))
-        XCTAssertEqual(record?.payload, Data("new local typing".utf8))
-        XCTAssertEqual(result.ignoredStaleIDs, [change.id])
-        XCTAssertEqual(conflicts.first?.localText, "new local typing")
-        XCTAssertEqual(conflicts.first?.remoteText, "current winner")
+        XCTAssertEqual(record?.payload, Data("current winner".utf8))
+        XCTAssertEqual(result.appliedChangeIDs, [change.id])
+        XCTAssertTrue(conflicts.isEmpty)
     }
 
     func testQueuePersistenceFailureIsReported() {

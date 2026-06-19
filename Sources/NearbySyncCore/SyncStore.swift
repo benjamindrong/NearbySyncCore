@@ -57,18 +57,21 @@ public actor InMemorySyncStore: SyncStore {
 public actor LocalFirstTextSyncStore: SyncStore {
     private let localDeviceID: String
     private let conflictStore: SyncTextConflictStore
+    private let textApplicationGate: SyncTextApplicationGate
     private var records: [RecordKey: SyncRecord] = [:]
-    private var remoteBaselines: [RecordKey: SyncRecord] = [:]
+    private var remoteBaselines: [RecordKey: RemoteTextBaseline] = [:]
     private var pendingLocalTextBaselines: [RecordKey: PendingTextBaseline] = [:]
     private var lastPreservedConflicts: [SyncTextConflictVersion] = []
 
     public init(
         localDeviceID: String,
         conflictStore: SyncTextConflictStore,
+        textApplicationGate: @escaping SyncTextApplicationGate = { _ in .allowAutomaticApply },
         seedRecords: [SyncRecord] = []
     ) {
         self.localDeviceID = localDeviceID
         self.conflictStore = conflictStore
+        self.textApplicationGate = textApplicationGate
         for record in seedRecords {
             records[RecordKey(type: record.entityType, id: record.entityID)] = record
         }
@@ -86,8 +89,14 @@ public actor LocalFirstTextSyncStore: SyncStore {
         }
 
         let key = RecordKey(type: change.entityType, id: change.entityID)
+        let fieldID = "text"
 
         if let existing = records[key], existing.updatedAt > change.updatedAt {
+            return false
+        }
+
+        if change.originDeviceID == localDeviceID,
+           conflictStore.hasActiveConflict(entityType: change.entityType, entityID: change.entityID, fieldID: fieldID) {
             return false
         }
 
@@ -111,7 +120,7 @@ public actor LocalFirstTextSyncStore: SyncStore {
         )
         records[key] = record
         if change.originDeviceID != localDeviceID {
-            remoteBaselines[key] = record
+            remoteBaselines[key] = RemoteTextBaseline(record: record, originDeviceID: change.originDeviceID)
             pendingLocalTextBaselines.removeValue(forKey: key)
         }
         return true
@@ -136,7 +145,7 @@ public actor LocalFirstTextSyncStore: SyncStore {
         if let pendingBaseline = pendingLocalTextBaselines[key] {
             baseline = pendingBaseline
         } else {
-            let baselineText = remoteBaselines[key].flatMap { String(data: $0.payload, encoding: .utf8) }
+            let baselineText = remoteBaselines[key].flatMap { String(data: $0.record.payload, encoding: .utf8) }
                 ?? records[key].flatMap { String(data: $0.payload, encoding: .utf8) }
             baseline = PendingTextBaseline(text: baselineText)
             pendingLocalTextBaselines[key] = baseline
@@ -163,7 +172,7 @@ public actor LocalFirstTextSyncStore: SyncStore {
             // shared state. The next local edit should diff from this text, but
             // all collapsed offline edits before acknowledgement keep the older
             // base so they cannot merge against a previous keystroke.
-            remoteBaselines[key] = record
+            remoteBaselines[key] = RemoteTextBaseline(record: record, originDeviceID: localDeviceID)
             pendingLocalTextBaselines.removeValue(forKey: key)
         }
     }
@@ -185,13 +194,14 @@ public actor LocalFirstTextSyncStore: SyncStore {
             updatedAt: Date(),
             isDeleted: false
         )
-        remoteBaselines[key] = SyncRecord(
+        let record = SyncRecord(
             entityType: conflict.entityType,
             entityID: conflict.entityID,
             payload: Data(conflict.remoteText.utf8),
             updatedAt: conflict.remoteUpdatedAt,
             isDeleted: false
         )
+        remoteBaselines[key] = RemoteTextBaseline(record: record, originDeviceID: nil)
         return conflictStore.removeResolvedConflict(conflict)
     }
 
@@ -243,7 +253,7 @@ public actor LocalFirstTextSyncStore: SyncStore {
                 isDeleted: false
             )
             records[key] = record
-            remoteBaselines[key] = record
+            remoteBaselines[key] = RemoteTextBaseline(record: record, originDeviceID: nil)
             return true
         case .noOp:
             _ = conflictStore.removeConflict(id: conflict.id)
@@ -257,21 +267,53 @@ public actor LocalFirstTextSyncStore: SyncStore {
                 isDeleted: false
             )
             records[key] = record
-            remoteBaselines[key] = record
+            remoteBaselines[key] = RemoteTextBaseline(record: record, originDeviceID: nil)
             return true
         }
     }
 
     private func incomingTextResolution(existing: SyncRecord, change: SyncChange) -> IncomingTextResolution {
         let key = RecordKey(type: change.entityType, id: change.entityID)
+        let fieldID = "text"
         let localText = String(data: existing.payload, encoding: .utf8) ?? ""
         let incomingPayload = SyncTextPayload.decodeText(from: change.payload)
         let remoteText = incomingPayload.text
-        let baselineText = incomingPayload.baseText
-            ?? remoteBaselines[key].flatMap { String(data: $0.payload, encoding: .utf8) }
+        let baseline = SyncTextBaselineSelector.select(
+            trackedBaseline: remoteBaselines[key]?.syncTextBaseline,
+            incomingBaseText: incomingPayload.baseText,
+            incomingOriginDeviceID: change.originDeviceID
+        )
 
-        switch SyncThreeWayTextMergePolicy.merge(base: baselineText, local: localText, remote: remoteText) {
+        let context = SyncTextApplicationContext(
+            entityType: change.entityType,
+            entityID: change.entityID,
+            fieldID: fieldID,
+            localText: localText,
+            remoteText: remoteText,
+            baseText: baseline.text,
+            remoteUpdatedAt: change.updatedAt
+        )
+
+        if conflictStore.hasActiveConflict(entityType: change.entityType, entityID: change.entityID, fieldID: fieldID) {
+            return preserveIncomingText(
+                change: change,
+                fieldID: fieldID,
+                localText: localText,
+                remoteText: remoteText
+            )
+        }
+
+        switch SyncThreeWayTextMergePolicy.merge(base: baseline.text, local: localText, remote: remoteText) {
         case .apply(let remoteText), .merged(let remoteText):
+            if remoteText != localText,
+               textApplicationGate(context) == .preserveForReview {
+                return preserveIncomingText(
+                    change: change,
+                    fieldID: fieldID,
+                    localText: localText,
+                    remoteText: remoteText
+                )
+            }
             return .store(remoteText)
         case .noOp:
             return .store(localText)
@@ -279,18 +321,41 @@ public actor LocalFirstTextSyncStore: SyncStore {
             break
         }
 
+        return preserveIncomingText(
+            change: change,
+            fieldID: fieldID,
+            localText: localText,
+            remoteText: remoteText
+        )
+    }
+
+    private func preserveIncomingText(
+        change: SyncChange,
+        fieldID: String,
+        localText: String,
+        remoteText: String
+    ) -> IncomingTextResolution {
         guard let conflict = SyncTextConflictPolicy.conflictIfTextDiverged(
             entityType: change.entityType,
             entityID: change.entityID,
-            fieldID: "text",
+            fieldID: fieldID,
             remoteOperation: change.operation,
             localText: localText,
             remoteText: remoteText,
             remoteUpdatedAt: change.updatedAt
         ) else { return .store(localText) }
 
-        _ = conflictStore.preserve(conflict)
+        let conflictsBeforePreserve = conflictStore.activeConflicts()
+        let conflicts = conflictStore.preserve(conflict)
         lastPreservedConflicts = [conflict]
+        if conflicts == conflictsBeforePreserve,
+           conflictStore.queuedConflict(
+                entityType: change.entityType,
+                entityID: change.entityID,
+                fieldID: fieldID
+           ) != nil {
+            lastPreservedConflicts = []
+        }
         return .conflict
     }
 }
@@ -302,6 +367,18 @@ private enum IncomingTextResolution {
 
 private struct PendingTextBaseline {
     let text: String?
+}
+
+private struct RemoteTextBaseline {
+    let record: SyncRecord
+    let originDeviceID: String?
+
+    var syncTextBaseline: SyncTextTrackedBaseline {
+        SyncTextTrackedBaseline(
+            text: String(data: record.payload, encoding: .utf8),
+            originDeviceID: originDeviceID
+        )
+    }
 }
 
 private struct RecordKey: Hashable {

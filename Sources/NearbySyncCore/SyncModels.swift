@@ -266,6 +266,107 @@ public struct SyncTextConflictVersion: Codable, Equatable, Identifiable, Sendabl
     }
 }
 
+public struct SyncTextApplicationContext: Equatable, Sendable {
+    public let entityType: SyncEntityType
+    public let entityID: String
+    public let fieldID: String
+    public let localText: String
+    public let remoteText: String
+    public let baseText: String?
+    public let remoteUpdatedAt: Date
+    public let receivedAt: Date
+
+    public init(
+        entityType: SyncEntityType,
+        entityID: String,
+        fieldID: String,
+        localText: String,
+        remoteText: String,
+        baseText: String?,
+        remoteUpdatedAt: Date,
+        receivedAt: Date = Date()
+    ) {
+        self.entityType = entityType
+        self.entityID = entityID
+        self.fieldID = fieldID
+        self.localText = localText
+        self.remoteText = remoteText
+        self.baseText = baseText
+        self.remoteUpdatedAt = remoteUpdatedAt
+        self.receivedAt = receivedAt
+    }
+}
+
+public enum SyncTextApplicationDecision: Equatable, Sendable {
+    case allowAutomaticApply
+    case preserveForReview
+}
+
+public typealias SyncTextApplicationGate = @Sendable (SyncTextApplicationContext) -> SyncTextApplicationDecision
+
+public struct SyncTextTrackedBaseline: Equatable, Sendable {
+    public let text: String?
+    public let data: Data?
+    public let originDeviceID: String?
+
+    public init(text: String?, data: Data? = nil, originDeviceID: String?) {
+        self.text = text
+        self.data = data
+        self.originDeviceID = originDeviceID
+    }
+}
+
+public struct SyncTextSelectedBaseline: Equatable, Sendable {
+    public let text: String?
+    public let data: Data?
+    public let matchesIncomingBase: Bool
+
+    public init(text: String?, data: Data? = nil, matchesIncomingBase: Bool) {
+        self.text = text
+        self.data = data
+        self.matchesIncomingBase = matchesIncomingBase
+    }
+
+    public func localHasDiverged(text localText: String, data localData: Data? = nil) -> Bool {
+        localText != text || localData != data
+    }
+}
+
+public enum SyncTextBaselineSelector {
+    public static func select(
+        trackedBaseline: SyncTextTrackedBaseline?,
+        incomingBaseText: String?,
+        incomingBaseData: Data? = nil,
+        incomingOriginDeviceID: String
+    ) -> SyncTextSelectedBaseline {
+        guard let trackedBaseline else {
+            return SyncTextSelectedBaseline(
+                text: incomingBaseText,
+                data: incomingBaseData,
+                matchesIncomingBase: incomingBaseText == nil && incomingBaseData == nil
+            )
+        }
+
+        if trackedBaseline.originDeviceID == incomingOriginDeviceID {
+            // Same-peer edit bursts can carry a pre-burst base until they are
+            // acknowledged. Prefer the receiver's applied same-peer baseline so
+            // local churn arrives as continuation, not a false conflict.
+            return SyncTextSelectedBaseline(
+                text: trackedBaseline.text,
+                data: trackedBaseline.data,
+                matchesIncomingBase: true
+            )
+        }
+
+        return SyncTextSelectedBaseline(
+            text: incomingBaseText ?? trackedBaseline.text,
+            data: incomingBaseData ?? trackedBaseline.data,
+            matchesIncomingBase: incomingBaseText == trackedBaseline.text
+                && incomingBaseData == trackedBaseline.data
+        )
+    }
+}
+
 public struct SyncTextConflictPerspective: Equatable, Sendable {
     public let localText: String
     public let versionToSyncText: String
@@ -298,6 +399,7 @@ public struct SyncTextConflictResolution: Equatable, Sendable {
 public enum SyncTextConflictResolutionChoice: Equatable, Sendable {
     case keepLocal(currentLocalText: String, currentLocalData: Data? = nil)
     case acceptIncoming
+    case merged(text: String, data: Data? = nil)
 }
 
 public enum SyncTextConflictResolver {
@@ -320,6 +422,14 @@ public enum SyncTextConflictResolver {
                 baseText: conflict.localText,
                 resolvedData: conflict.remoteData,
                 usesRemoteData: true
+            )
+
+        case .merged(let text, let data):
+            return SyncTextConflictResolution(
+                resolvedText: text,
+                baseText: conflict.remoteText,
+                resolvedData: data,
+                usesRemoteData: false
             )
         }
     }
@@ -548,6 +658,16 @@ private struct SyncTextResolvedConflict: Codable, Equatable {
     }
 }
 
+public struct SyncTextQueuedConflict: Codable, Equatable, Sendable {
+    public let conflict: SyncTextConflictVersion
+    public let queuedAt: Date
+
+    public init(conflict: SyncTextConflictVersion, queuedAt: Date = Date()) {
+        self.conflict = conflict
+        self.queuedAt = queuedAt
+    }
+}
+
 public final class SyncTextConflictStore: @unchecked Sendable {
     private let fileURL: URL
     private let encoder = JSONEncoder()
@@ -572,12 +692,38 @@ public final class SyncTextConflictStore: @unchecked Sendable {
         guard !isResolved(conflict) else {
             return activeConflicts()
         }
+        let conflicts = activeConflicts()
+        if conflicts.contains(where: { sameLogicalConflict($0, conflict) }) {
+            queue(conflict)
+            return conflicts
+        }
+
         // A text field can only have one reviewable conflict at a time. Newer
-        // preserved metadata replaces stale rows for the same entity field.
-        var conflicts = activeConflicts().filter { !sameLogicalConflict($0, conflict) }
-        conflicts.append(conflict)
-        _ = saveConflicts(conflicts)
+        // updates for that field wait behind the stable review snapshot.
+        var updatedConflicts = conflicts
+        updatedConflicts.append(conflict)
+        _ = saveConflicts(updatedConflicts)
         return activeConflicts()
+    }
+
+    public func hasActiveConflict(entityType: SyncEntityType, entityID: String, fieldID: String, now: Date = Date()) -> Bool {
+        activeConflicts(now: now).contains {
+            $0.entityType == entityType
+                && $0.entityID == entityID
+                && $0.fieldID == fieldID
+        }
+    }
+
+    public func queuedConflict(entityType: SyncEntityType, entityID: String, fieldID: String) -> SyncTextQueuedConflict? {
+        loadQueuedConflicts().first {
+            $0.conflict.entityType == entityType
+                && $0.conflict.entityID == entityID
+                && $0.conflict.fieldID == fieldID
+        }
+    }
+
+    public func queuedConflicts() -> [SyncTextQueuedConflict] {
+        loadQueuedConflicts()
     }
 
     public func removeConflict(id: UUID) -> [SyncTextConflictVersion] {
@@ -603,6 +749,7 @@ public final class SyncTextConflictStore: @unchecked Sendable {
             !sameLogicalConflict($0, conflict) && !sameRemoteConflict($0, conflict)
         }
         _ = saveConflicts(remainingConflicts)
+        removeQueuedConflict(matching: conflict)
         return remainingConflicts
     }
 
@@ -714,8 +861,47 @@ public final class SyncTextConflictStore: @unchecked Sendable {
         return sameOrientation || reversedOrientation
     }
 
+    private func queue(_ conflict: SyncTextConflictVersion, queuedAt: Date = Date()) {
+        var queuedConflicts = loadQueuedConflicts()
+        queuedConflicts.removeAll { sameLogicalConflict($0.conflict, conflict) }
+        queuedConflicts.append(SyncTextQueuedConflict(conflict: conflict, queuedAt: queuedAt))
+        _ = saveQueuedConflicts(queuedConflicts)
+    }
+
+    private func removeQueuedConflict(matching conflict: SyncTextConflictVersion) {
+        let queuedConflicts = loadQueuedConflicts().filter {
+            !sameLogicalConflict($0.conflict, conflict)
+        }
+        _ = saveQueuedConflicts(queuedConflicts)
+    }
+
+    private func loadQueuedConflicts() -> [SyncTextQueuedConflict] {
+        guard let data = try? Data(contentsOf: queuedFileURL) else { return [] }
+        return (try? decoder.decode([SyncTextQueuedConflict].self, from: data)) ?? []
+    }
+
+    @discardableResult
+    private func saveQueuedConflicts(_ queuedConflicts: [SyncTextQueuedConflict]) -> SyncPersistenceResult {
+        do {
+            try FileManager.default.createDirectory(
+                at: queuedFileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let data = try encoder.encode(queuedConflicts)
+            try data.write(to: queuedFileURL, options: [.atomic])
+            return SyncPersistenceResult(didPersist: true)
+        } catch {
+            return SyncPersistenceResult(didPersist: false, errorDescription: String(describing: error))
+        }
+    }
+
     private var resolvedFileURL: URL {
         fileURL.deletingLastPathComponent()
             .appendingPathComponent("sync-resolved-conflicts.json")
+    }
+
+    private var queuedFileURL: URL {
+        fileURL.deletingLastPathComponent()
+            .appendingPathComponent("sync-queued-conflicts.json")
     }
 }
