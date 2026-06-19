@@ -304,6 +304,69 @@ public enum SyncTextApplicationDecision: Equatable, Sendable {
 
 public typealias SyncTextApplicationGate = @Sendable (SyncTextApplicationContext) -> SyncTextApplicationDecision
 
+public struct SyncTextTrackedBaseline: Equatable, Sendable {
+    public let text: String?
+    public let data: Data?
+    public let originDeviceID: String?
+
+    public init(text: String?, data: Data? = nil, originDeviceID: String?) {
+        self.text = text
+        self.data = data
+        self.originDeviceID = originDeviceID
+    }
+}
+
+public struct SyncTextSelectedBaseline: Equatable, Sendable {
+    public let text: String?
+    public let data: Data?
+    public let matchesIncomingBase: Bool
+
+    public init(text: String?, data: Data? = nil, matchesIncomingBase: Bool) {
+        self.text = text
+        self.data = data
+        self.matchesIncomingBase = matchesIncomingBase
+    }
+
+    public func localHasDiverged(text localText: String, data localData: Data? = nil) -> Bool {
+        localText != text || localData != data
+    }
+}
+
+public enum SyncTextBaselineSelector {
+    public static func select(
+        trackedBaseline: SyncTextTrackedBaseline?,
+        incomingBaseText: String?,
+        incomingBaseData: Data? = nil,
+        incomingOriginDeviceID: String
+    ) -> SyncTextSelectedBaseline {
+        guard let trackedBaseline else {
+            return SyncTextSelectedBaseline(
+                text: incomingBaseText,
+                data: incomingBaseData,
+                matchesIncomingBase: incomingBaseText == nil && incomingBaseData == nil
+            )
+        }
+
+        if trackedBaseline.originDeviceID == incomingOriginDeviceID {
+            // Same-peer edit bursts can carry a pre-burst base until they are
+            // acknowledged. Prefer the receiver's applied same-peer baseline so
+            // local churn arrives as continuation, not a false conflict.
+            return SyncTextSelectedBaseline(
+                text: trackedBaseline.text,
+                data: trackedBaseline.data,
+                matchesIncomingBase: true
+            )
+        }
+
+        return SyncTextSelectedBaseline(
+            text: incomingBaseText ?? trackedBaseline.text,
+            data: incomingBaseData ?? trackedBaseline.data,
+            matchesIncomingBase: incomingBaseText == trackedBaseline.text
+                && incomingBaseData == trackedBaseline.data
+        )
+    }
+}
+
 public struct SyncTextConflictPerspective: Equatable, Sendable {
     public let localText: String
     public let versionToSyncText: String

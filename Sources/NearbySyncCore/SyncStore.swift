@@ -278,17 +278,11 @@ public actor LocalFirstTextSyncStore: SyncStore {
         let localText = String(data: existing.payload, encoding: .utf8) ?? ""
         let incomingPayload = SyncTextPayload.decodeText(from: change.payload)
         let remoteText = incomingPayload.text
-        let trackedBaseline = remoteBaselines[key]
-        let baselineText: String?
-        if trackedBaseline?.originDeviceID == change.originDeviceID {
-            // Same-peer edit bursts can carry a base from before the burst was
-            // acknowledged. Use the receiver's applied same-peer baseline so
-            // delete/retype churn is treated as continuation, not divergence.
-            baselineText = trackedBaseline.flatMap { String(data: $0.record.payload, encoding: .utf8) }
-        } else {
-            baselineText = incomingPayload.baseText
-                ?? trackedBaseline.flatMap { String(data: $0.record.payload, encoding: .utf8) }
-        }
+        let baseline = SyncTextBaselineSelector.select(
+            trackedBaseline: remoteBaselines[key]?.syncTextBaseline,
+            incomingBaseText: incomingPayload.baseText,
+            incomingOriginDeviceID: change.originDeviceID
+        )
 
         let context = SyncTextApplicationContext(
             entityType: change.entityType,
@@ -296,7 +290,7 @@ public actor LocalFirstTextSyncStore: SyncStore {
             fieldID: fieldID,
             localText: localText,
             remoteText: remoteText,
-            baseText: baselineText,
+            baseText: baseline.text,
             remoteUpdatedAt: change.updatedAt
         )
 
@@ -309,7 +303,7 @@ public actor LocalFirstTextSyncStore: SyncStore {
             )
         }
 
-        switch SyncThreeWayTextMergePolicy.merge(base: baselineText, local: localText, remote: remoteText) {
+        switch SyncThreeWayTextMergePolicy.merge(base: baseline.text, local: localText, remote: remoteText) {
         case .apply(let remoteText), .merged(let remoteText):
             if remoteText != localText,
                textApplicationGate(context) == .preserveForReview {
@@ -378,6 +372,13 @@ private struct PendingTextBaseline {
 private struct RemoteTextBaseline {
     let record: SyncRecord
     let originDeviceID: String?
+
+    var syncTextBaseline: SyncTextTrackedBaseline {
+        SyncTextTrackedBaseline(
+            text: String(data: record.payload, encoding: .utf8),
+            originDeviceID: originDeviceID
+        )
+    }
 }
 
 private struct RecordKey: Hashable {
