@@ -578,7 +578,21 @@ final class NearbySyncCoreTests: XCTestCase {
             remote: "alpha beta gamma remote"
         )
 
-        XCTAssertEqual(result, .merged("alpha local beta gamma remote"))
+        XCTAssertEqual(result.mergedText, "alpha local beta gamma remote")
+        XCTAssertEqual(result.patch?.applying(to: "alpha local beta gamma"), "alpha local beta gamma remote")
+    }
+
+    func testThreeWayTextMergePatchUsesUTF16Offsets() {
+        let result = SyncThreeWayTextMergePolicy.merge(
+            base: "a 😀 c",
+            local: "a 😀 local c",
+            remote: "a 😀 c remote"
+        )
+
+        XCTAssertEqual(result.mergedText, "a 😀 local c remote")
+        XCTAssertEqual(result.patch?.range, NSRange(location: 12, length: 0))
+        XCTAssertEqual(result.patch?.replacement, " remote")
+        XCTAssertEqual(result.patch?.applying(to: "a 😀 local c"), "a 😀 local c remote")
     }
 
     func testThreeWayTextMergeConflictsMissingBase() {

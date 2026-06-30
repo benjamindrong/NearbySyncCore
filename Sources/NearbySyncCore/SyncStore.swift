@@ -244,7 +244,7 @@ public actor LocalFirstTextSyncStore: SyncStore {
         let localText = records[key].flatMap { String(data: $0.payload, encoding: .utf8) } ?? ""
 
         switch SyncThreeWayTextMergePolicy.merge(base: baseText, local: localText, remote: resolvedText) {
-        case .apply(let text), .merged(let text):
+        case .apply(let text), .merged(let text, _):
             let record = SyncRecord(
                 entityType: conflict.entityType,
                 entityID: conflict.entityID,
@@ -304,7 +304,7 @@ public actor LocalFirstTextSyncStore: SyncStore {
         }
 
         switch SyncThreeWayTextMergePolicy.merge(base: baseline.text, local: localText, remote: remoteText) {
-        case .apply(let remoteText), .merged(let remoteText):
+        case .apply(let remoteText), .merged(let remoteText, _):
             if remoteText != localText,
                textApplicationGate(context) == .preserveForReview {
                 return preserveIncomingText(
