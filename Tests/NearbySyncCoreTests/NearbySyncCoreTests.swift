@@ -582,6 +582,42 @@ final class NearbySyncCoreTests: XCTestCase {
         XCTAssertEqual(result.patch?.applying(to: "alpha local beta gamma"), "alpha local beta gamma remote")
     }
 
+    func testTextPatchReplacesGrapheme() {
+        let patch = SyncTextPatch.from(local: "😀", to: "😃")
+
+        XCTAssertEqual(patch.range, NSRange(location: 0, length: 2))
+        XCTAssertEqual(patch.replacement, "😃")
+        XCTAssertEqual(patch.applying(to: "😀"), "😃")
+    }
+
+    func testTextPatchCapturesInsertion() {
+        let patch = SyncTextPatch.from(local: "alpha gamma", to: "alpha beta gamma")
+
+        XCTAssertEqual(patch.replacement, "beta ")
+        XCTAssertEqual(patch.applying(to: "alpha gamma"), "alpha beta gamma")
+    }
+
+    func testTextPatchCapturesDeletion() {
+        let patch = SyncTextPatch.from(local: "alpha beta gamma", to: "alpha gamma")
+
+        XCTAssertEqual(patch.replacement, "")
+        XCTAssertEqual(patch.applying(to: "alpha beta gamma"), "alpha gamma")
+    }
+
+    func testTextPatchCapturesReplacement() {
+        let patch = SyncTextPatch.from(local: "alpha beta gamma", to: "alpha delta gamma")
+
+        XCTAssertEqual(patch.applying(to: "alpha beta gamma"), "alpha delta gamma")
+    }
+
+    func testTextPatchCapturesIdenticalStrings() {
+        let patch = SyncTextPatch.from(local: "same", to: "same")
+
+        XCTAssertEqual(patch.range, NSRange(location: 4, length: 0))
+        XCTAssertEqual(patch.replacement, "")
+        XCTAssertEqual(patch.applying(to: "same"), "same")
+    }
+
     func testThreeWayTextMergePatchUsesUTF16Offsets() {
         let result = SyncThreeWayTextMergePolicy.merge(
             base: "a 😀 c",
@@ -593,6 +629,12 @@ final class NearbySyncCoreTests: XCTestCase {
         XCTAssertEqual(result.patch?.range, NSRange(location: 12, length: 0))
         XCTAssertEqual(result.patch?.replacement, " remote")
         XCTAssertEqual(result.patch?.applying(to: "a 😀 local c"), "a 😀 local c remote")
+    }
+
+    func testTextPatchDeltaCapturesBaseToChangedText() {
+        let delta = SyncTextPatch.delta(from: "one two three", to: "one too three")
+
+        XCTAssertEqual(delta.applying(to: "one two three"), "one too three")
     }
 
     func testThreeWayTextMergeConflictsMissingBase() {

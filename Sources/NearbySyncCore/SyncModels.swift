@@ -518,15 +518,14 @@ public enum SyncTextConflictPolicy {
 }
 
 public enum SyncTextMergeResult: Equatable, Sendable {
-    case apply(remoteText: String)
     case noOp
-    case merged(String, patch: SyncTextPatch?)
+    case apply(text: String, patch: SyncTextPatch)
     case conflict
 
     public var mergedText: String? {
         switch self {
-        case .apply(let remoteText), .merged(let remoteText, _):
-            remoteText
+        case .apply(let text, _):
+            text
         case .noOp, .conflict:
             nil
         }
@@ -534,15 +533,15 @@ public enum SyncTextMergeResult: Equatable, Sendable {
 
     public var patch: SyncTextPatch? {
         switch self {
-        case .merged(_, let patch):
+        case .apply(_, let patch):
             patch
-        case .apply, .noOp, .conflict:
+        case .noOp, .conflict:
             nil
         }
     }
 }
 
-public struct SyncTextPatch: Codable, Equatable, Sendable {
+public struct SyncTextPatch: Equatable, Sendable {
     public let range: NSRange
     public let replacement: String
 
@@ -556,6 +555,43 @@ public struct SyncTextPatch: Codable, Equatable, Sendable {
         guard NSMaxRange(range) <= nsText.length else { return nil }
         return nsText.replacingCharacters(in: range, with: replacement)
     }
+
+    public static func from(local: String, to target: String) -> SyncTextPatch {
+        var localStart = local.startIndex
+        var targetStart = target.startIndex
+
+        while localStart < local.endIndex,
+              targetStart < target.endIndex,
+              local[localStart] == target[targetStart] {
+            local.formIndex(after: &localStart)
+            target.formIndex(after: &targetStart)
+        }
+
+        var localEnd = local.endIndex
+        var targetEnd = target.endIndex
+
+        while localEnd > localStart,
+              targetEnd > targetStart {
+            let previousLocal = local.index(before: localEnd)
+            let previousTarget = target.index(before: targetEnd)
+
+            guard local[previousLocal] == target[previousTarget] else {
+                break
+            }
+
+            localEnd = previousLocal
+            targetEnd = previousTarget
+        }
+
+        return SyncTextPatch(
+            range: NSRange(localStart..<localEnd, in: local),
+            replacement: String(target[targetStart..<targetEnd])
+        )
+    }
+
+    public static func delta(from base: String, to changed: String) -> SyncTextPatch {
+        from(local: base, to: changed)
+    }
 }
 
 public enum SyncThreeWayTextMergePolicy {
@@ -564,12 +600,12 @@ public enum SyncThreeWayTextMergePolicy {
             return local == remote ? .noOp : .conflict
         }
         if local == remote { return .noOp }
-        if local == base { return .apply(remoteText: remote) }
+        if local == base { return .apply(text: remote, patch: SyncTextPatch.from(local: local, to: remote)) }
         if remote == base { return .noOp }
         guard let mergedText = nonOverlappingMerge(base: base, local: local, remote: remote) else {
             return .conflict
         }
-        return .merged(mergedText, patch: patch(from: local, to: mergedText))
+        return .apply(text: mergedText, patch: SyncTextPatch.from(local: local, to: mergedText))
     }
 
     private static func nonOverlappingMerge(base: String, local: String, remote: String) -> String? {
@@ -613,38 +649,6 @@ public enum SyncThreeWayTextMergePolicy {
             lowerBound: prefix,
             upperBound: suffixBase,
             replacement: String(changed[prefix..<suffixChanged])
-        )
-    }
-
-    public static func patch(from local: String, to merged: String) -> SyncTextPatch? {
-        if local == merged {
-            return SyncTextPatch(range: NSRange(location: (local as NSString).length, length: 0), replacement: "")
-        }
-
-        let localText = local as NSString
-        let mergedText = merged as NSString
-        let localLength = localText.length
-        let mergedLength = mergedText.length
-        var prefix = 0
-
-        while prefix < localLength,
-              prefix < mergedLength,
-              localText.character(at: prefix) == mergedText.character(at: prefix) {
-            prefix += 1
-        }
-
-        var localSuffix = localLength
-        var mergedSuffix = mergedLength
-        while localSuffix > prefix,
-              mergedSuffix > prefix,
-              localText.character(at: localSuffix - 1) == mergedText.character(at: mergedSuffix - 1) {
-            localSuffix -= 1
-            mergedSuffix -= 1
-        }
-
-        return SyncTextPatch(
-            range: NSRange(location: prefix, length: localSuffix - prefix),
-            replacement: mergedText.substring(with: NSRange(location: prefix, length: mergedSuffix - prefix))
         )
     }
 }
