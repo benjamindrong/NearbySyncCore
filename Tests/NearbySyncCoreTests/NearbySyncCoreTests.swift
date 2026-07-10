@@ -1517,4 +1517,210 @@ final class NearbySyncCoreTests: XCTestCase {
         XCTAssertFalse(result.didPersist)
         XCTAssertNotNil(result.errorDescription)
     }
+
+    func testSyncQueueSnapshotRoundTripsAllFields() throws {
+        let fileURL = temporaryQueueURL()
+        defer { try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent()) }
+        let change = makeQueueChange(entityID: "item-1")
+        let appliedID = UUID()
+        let acknowledgementID = UUID()
+        let snapshot = SyncQueueSnapshot(
+            pendingChanges: [change],
+            appliedChangeIDs: [appliedID],
+            pendingAcknowledgementIDs: [acknowledgementID]
+        )
+
+        let saveResult = FileBackedSyncQueuePersistence(fileURL: fileURL).saveSnapshot(snapshot)
+        let loadResult = FileBackedSyncQueuePersistence(fileURL: fileURL).loadSnapshotResult()
+
+        XCTAssertTrue(saveResult.didPersist)
+        XCTAssertEqual(loadResult.health, .healthy)
+        XCTAssertEqual(loadResult.snapshot, snapshot)
+    }
+
+    func testMissingQueueFileReportsFileMissing() {
+        let loadResult = FileBackedSyncQueuePersistence(fileURL: temporaryQueueURL()).loadSnapshotResult()
+
+        XCTAssertEqual(loadResult.health, .fileMissing)
+        XCTAssertEqual(loadResult.snapshot, SyncQueueSnapshot())
+    }
+
+    func testLegacyBareChangeArrayMigratesAsHealthySnapshot() throws {
+        let fileURL = temporaryQueueURL()
+        defer { try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent()) }
+        let legacyChanges = [makeQueueChange(entityID: "item-1")]
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try JSONEncoder().encode(legacyChanges).write(to: fileURL, options: [.atomic])
+
+        let loadResult = FileBackedSyncQueuePersistence(fileURL: fileURL).loadSnapshotResult()
+
+        XCTAssertEqual(loadResult.health, .healthy)
+        XCTAssertEqual(loadResult.snapshot, SyncQueueSnapshot(pendingChanges: legacyChanges))
+    }
+
+    func testCorruptQueueFileReportsCorruptHealth() throws {
+        let fileURL = temporaryQueueURL()
+        defer { try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent()) }
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("not-json".utf8).write(to: fileURL, options: [.atomic])
+
+        let loadResult = FileBackedSyncQueuePersistence(fileURL: fileURL).loadSnapshotResult()
+
+        XCTAssertEqual(loadResult.health, .corrupt)
+        XCTAssertEqual(loadResult.snapshot, SyncQueueSnapshot())
+    }
+
+    func testReplaceSnapshotPersistsAndReloadsExactly() async throws {
+        let fileURL = temporaryQueueURL()
+        defer { try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent()) }
+        let replacement = SyncQueueSnapshot(
+            pendingChanges: [makeQueueChange(entityID: "item-1")],
+            appliedChangeIDs: [UUID()],
+            pendingAcknowledgementIDs: [UUID()]
+        )
+        let queue = SyncQueue(persistence: FileBackedSyncQueuePersistence(fileURL: fileURL))
+
+        try await queue.replaceSnapshot(replacement)
+
+        let reloadedQueue = SyncQueue(persistence: FileBackedSyncQueuePersistence(fileURL: fileURL))
+        let queueSnapshot = await queue.snapshot()
+        let queueHealth = await queue.persistenceHealth()
+        let reloadedSnapshot = await reloadedQueue.snapshot()
+        XCTAssertEqual(queueSnapshot, replacement)
+        XCTAssertEqual(queueHealth, .healthy)
+        XCTAssertEqual(reloadedSnapshot, replacement)
+    }
+
+    func testReplaceSnapshotFailureLeavesMemoryAndDiskUnchanged() async throws {
+        let initial = SyncQueueSnapshot(
+            pendingChanges: [makeQueueChange(entityID: "item-1")],
+            appliedChangeIDs: [UUID()],
+            pendingAcknowledgementIDs: [UUID()]
+        )
+        let persistence = FailingSyncQueuePersistence(
+            loadResult: SyncQueuePersistenceLoadResult(snapshot: initial, health: .healthy)
+        )
+        let queue = SyncQueue(persistence: persistence)
+        let replacement = SyncQueueSnapshot(pendingChanges: [makeQueueChange(entityID: "item-2")])
+
+        do {
+            try await queue.replaceSnapshot(replacement)
+            XCTFail("Expected replacement to fail")
+        } catch {
+            XCTAssertEqual(error as? SyncQueueReplacementError, .persistenceFailed)
+        }
+
+        let queueSnapshot = await queue.snapshot()
+        XCTAssertEqual(queueSnapshot, initial)
+        XCTAssertEqual(persistence.savedSnapshots, [replacement])
+    }
+
+    func testReplaceSnapshotRejectsUnhealthyLoadedPersistence() async {
+        let queue = SyncQueue(
+            persistence: FailingSyncQueuePersistence(
+                loadResult: SyncQueuePersistenceLoadResult(snapshot: SyncQueueSnapshot(), health: .corrupt)
+            )
+        )
+
+        do {
+            try await queue.replaceSnapshot(SyncQueueSnapshot(pendingChanges: [makeQueueChange(entityID: "item-1")]))
+            XCTFail("Expected unhealthy replacement to fail")
+        } catch {
+            XCTAssertEqual(error as? SyncQueueReplacementError, .unhealthyPersistence)
+        }
+    }
+
+    func testOrdinaryPersistenceFailureBecomesObservableHealth() async {
+        let queue = SyncQueue(
+            persistence: FailingSyncQueuePersistence(
+                loadResult: SyncQueuePersistenceLoadResult(snapshot: SyncQueueSnapshot(), health: .healthy)
+            )
+        )
+
+        await queue.enqueue(makeQueueChange(entityID: "item-1"))
+
+        if case .readFailed = await queue.persistenceHealth() {
+            // Expected.
+        } else {
+            XCTFail("Expected failed enqueue persistence to mark the queue unhealthy")
+        }
+    }
+
+    func testDistinctTargetPaginationReturnsSecondPageAfterAcknowledgement() async throws {
+        let engine = SyncEngine(deviceID: "device-a", store: InMemorySyncStore())
+        for index in 0..<101 {
+            _ = await engine.recordLocalChange(
+                entityType: .item,
+                entityID: "item-\(index)",
+                payload: Data("payload-\(index)".utf8)
+            )
+        }
+
+        let firstOptionalEnvelope = await engine.nextEnvelope()
+        let firstEnvelope = try XCTUnwrap(firstOptionalEnvelope)
+        await engine.acknowledgeChanges(firstEnvelope.changes.map(\.id))
+        let secondOptionalEnvelope = await engine.nextEnvelope()
+        let secondEnvelope = try XCTUnwrap(secondOptionalEnvelope)
+
+        XCTAssertEqual(firstEnvelope.changes.count, 100)
+        XCTAssertEqual(secondEnvelope.changes.count, 1)
+    }
+
+    func testSameTargetChangesCoalesceAndDoNotExercisePagination() async throws {
+        let engine = SyncEngine(deviceID: "device-a", store: InMemorySyncStore())
+        for index in 0..<101 {
+            _ = await engine.recordLocalChange(
+                entityType: .item,
+                entityID: "item-1",
+                payload: Data("payload-\(index)".utf8)
+            )
+        }
+
+        let optionalEnvelope = await engine.nextEnvelope()
+        let envelope = try XCTUnwrap(optionalEnvelope)
+
+        XCTAssertEqual(envelope.changes.count, 1)
+        XCTAssertEqual(envelope.changes.first?.payload, Data("payload-100".utf8))
+    }
+
+    private func temporaryQueueURL() -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-queue.json")
+    }
+
+    private func makeQueueChange(entityID: String) -> SyncChange {
+        SyncChange(
+            entityType: .item,
+            entityID: entityID,
+            operation: .upsert,
+            payload: Data(entityID.utf8),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            originDeviceID: "device-a"
+        )
+    }
+}
+
+private final class FailingSyncQueuePersistence: SyncQueuePersistence, @unchecked Sendable {
+    private let loadResult: SyncQueuePersistenceLoadResult
+    private(set) var savedSnapshots: [SyncQueueSnapshot] = []
+
+    init(loadResult: SyncQueuePersistenceLoadResult) {
+        self.loadResult = loadResult
+    }
+
+    func loadSnapshotResult() -> SyncQueuePersistenceLoadResult {
+        loadResult
+    }
+
+    func saveSnapshot(_ snapshot: SyncQueueSnapshot) -> SyncPersistenceResult {
+        savedSnapshots.append(snapshot)
+        return SyncPersistenceResult(didPersist: false, errorDescription: "Injected failure")
+    }
 }
