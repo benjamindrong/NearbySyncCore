@@ -9,13 +9,18 @@ public actor SyncQueue {
     // sent in an ack-only envelope and removed once transport confirms send.
     private var pendingAcknowledgementIDs: Set<UUID> = []
     private let persistence: SyncQueuePersistence?
+    private var health: SyncQueuePersistenceHealth
 
     public init(persistence: SyncQueuePersistence? = nil) {
         self.persistence = persistence
-        let snapshot = persistence?.loadSnapshot() ?? SyncQueueSnapshot()
-        pendingChanges = snapshot.pendingChanges
-        appliedChangeIDs = Set(snapshot.appliedChangeIDs)
-        pendingAcknowledgementIDs = Set(snapshot.pendingAcknowledgementIDs)
+        let loadResult = persistence?.loadSnapshotResult() ?? SyncQueuePersistenceLoadResult(
+            snapshot: SyncQueueSnapshot(),
+            health: .healthy
+        )
+        pendingChanges = loadResult.snapshot.pendingChanges
+        appliedChangeIDs = Set(loadResult.snapshot.appliedChangeIDs)
+        pendingAcknowledgementIDs = Set(loadResult.snapshot.pendingAcknowledgementIDs)
+        health = loadResult.health
     }
 
     public func enqueue(_ change: SyncChange) {
@@ -79,20 +84,92 @@ public actor SyncQueue {
         pendingChanges.count
     }
 
+    public func snapshot() -> SyncQueueSnapshot {
+        currentSnapshot()
+    }
+
+    public func persistenceHealth() -> SyncQueuePersistenceHealth {
+        health
+    }
+
+    public func replaceSnapshot(_ replacement: SyncQueueSnapshot) throws {
+        switch health {
+        case .healthy, .fileMissing:
+            break
+        case .corrupt, .readFailed:
+            throw SyncQueueReplacementError.unhealthyPersistence
+        }
+
+        guard let persistence else {
+            assignSnapshot(replacement)
+            health = .healthy
+            return
+        }
+
+        let result = persistence.saveSnapshot(replacement)
+        guard result.didPersist else {
+            health = .readFailed(result.errorDescription ?? "Unknown persistence failure")
+            throw SyncQueueReplacementError.persistenceFailed
+        }
+
+        assignSnapshot(replacement)
+        health = .healthy
+    }
+
     private func persistPendingChanges() {
-        _ = persistence?.saveSnapshot(
-            SyncQueueSnapshot(
-                pendingChanges: pendingChanges,
-                appliedChangeIDs: Array(appliedChangeIDs),
-                pendingAcknowledgementIDs: Array(pendingAcknowledgementIDs)
-            )
+        guard let persistence else {
+            health = .healthy
+            return
+        }
+
+        let result = persistence.saveSnapshot(currentSnapshot())
+        if result.didPersist {
+            health = .healthy
+        } else {
+            health = .readFailed(result.errorDescription ?? "Unknown persistence failure")
+        }
+    }
+
+    private func currentSnapshot() -> SyncQueueSnapshot {
+        SyncQueueSnapshot(
+            pendingChanges: pendingChanges,
+            appliedChangeIDs: Array(appliedChangeIDs),
+            pendingAcknowledgementIDs: Array(pendingAcknowledgementIDs)
         )
+    }
+
+    private func assignSnapshot(_ snapshot: SyncQueueSnapshot) {
+        pendingChanges = snapshot.pendingChanges
+        appliedChangeIDs = Set(snapshot.appliedChangeIDs)
+        pendingAcknowledgementIDs = Set(snapshot.pendingAcknowledgementIDs)
     }
 }
 
 public protocol SyncQueuePersistence: Sendable {
-    func loadSnapshot() -> SyncQueueSnapshot
+    func loadSnapshotResult() -> SyncQueuePersistenceLoadResult
     func saveSnapshot(_ snapshot: SyncQueueSnapshot) -> SyncPersistenceResult
+}
+
+public enum SyncQueuePersistenceHealth: Equatable, Sendable {
+    case healthy
+    case fileMissing
+    case corrupt
+    case readFailed(String)
+}
+
+public struct SyncQueuePersistenceLoadResult: Equatable, Sendable {
+    public let snapshot: SyncQueueSnapshot
+    public let health: SyncQueuePersistenceHealth
+
+    public init(snapshot: SyncQueueSnapshot, health: SyncQueuePersistenceHealth) {
+        self.snapshot = snapshot
+        self.health = health
+    }
+}
+
+public enum SyncQueueReplacementError: Error, Equatable {
+    case persistenceFailed
+    case unhealthyPersistence
 }
 
 public struct SyncQueueSnapshot: Codable, Equatable, Sendable {
@@ -122,17 +199,33 @@ public final class FileBackedSyncQueuePersistence: SyncQueuePersistence, @unchec
         self.fileURL = fileURL
     }
 
-    public func loadSnapshot() -> SyncQueueSnapshot {
-        guard let data = try? Data(contentsOf: fileURL) else { return SyncQueueSnapshot() }
+    public func loadSnapshotResult() -> SyncQueuePersistenceLoadResult {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            return SyncQueuePersistenceLoadResult(snapshot: SyncQueueSnapshot(), health: .fileMissing)
+        }
+
+        let data: Data
+        do {
+            data = try Data(contentsOf: fileURL)
+        } catch {
+            return SyncQueuePersistenceLoadResult(
+                snapshot: SyncQueueSnapshot(),
+                health: .readFailed(String(describing: error))
+            )
+        }
+
         if let snapshot = try? decoder.decode(SyncQueueSnapshot.self, from: data) {
-            return snapshot
+            return SyncQueuePersistenceLoadResult(snapshot: snapshot, health: .healthy)
         }
         // MYR-71 wrote a bare [SyncChange]. Keep reading that legacy queue so
         // existing installs do not lose unsent local edits on upgrade.
         if let legacyChanges = try? decoder.decode([SyncChange].self, from: data) {
-            return SyncQueueSnapshot(pendingChanges: legacyChanges)
+            return SyncQueuePersistenceLoadResult(
+                snapshot: SyncQueueSnapshot(pendingChanges: legacyChanges),
+                health: .healthy
+            )
         }
-        return SyncQueueSnapshot()
+        return SyncQueuePersistenceLoadResult(snapshot: SyncQueueSnapshot(), health: .corrupt)
     }
 
     public func saveSnapshot(_ snapshot: SyncQueueSnapshot) -> SyncPersistenceResult {

@@ -104,6 +104,18 @@ public final class SyncEngine: @unchecked Sendable {
         await queue.pendingCount()
     }
 
+    public func queueSnapshot() async -> SyncQueueSnapshot {
+        await queue.snapshot()
+    }
+
+    public func queuePersistenceHealth() async -> SyncQueuePersistenceHealth {
+        await queue.persistenceHealth()
+    }
+
+    public func replaceQueueSnapshot(_ snapshot: SyncQueueSnapshot) async throws {
+        try await queue.replaceSnapshot(snapshot)
+    }
+
     public func records() async -> [SyncRecord] {
         await store.allRecords()
     }
