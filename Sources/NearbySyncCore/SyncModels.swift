@@ -987,4 +987,42 @@ public final class SyncTextConflictStore: @unchecked Sendable {
         fileURL.deletingLastPathComponent()
             .appendingPathComponent("sync-queued-conflicts.json")
     }
+
+    /// Captures the exact on-disk bytes backing active, resolved, and queued
+    /// conflict state. Intended for callers that must speculatively apply an
+    /// incoming change (which may write conflict metadata as a side effect)
+    /// and roll back that write if a separate, later persistence step fails.
+    public func snapshot() -> SyncTextConflictStoreSnapshot {
+        SyncTextConflictStoreSnapshot(
+            conflictsData: try? Data(contentsOf: fileURL),
+            resolvedData: try? Data(contentsOf: resolvedFileURL),
+            queuedData: try? Data(contentsOf: queuedFileURL)
+        )
+    }
+
+    /// Restores exactly the on-disk bytes captured by `snapshot()`, including
+    /// removing a file that did not exist at snapshot time.
+    public func restore(_ snapshot: SyncTextConflictStoreSnapshot) {
+        Self.writeOrRemove(snapshot.conflictsData, to: fileURL)
+        Self.writeOrRemove(snapshot.resolvedData, to: resolvedFileURL)
+        Self.writeOrRemove(snapshot.queuedData, to: queuedFileURL)
+    }
+
+    private static func writeOrRemove(_ data: Data?, to url: URL) {
+        guard let data else {
+            try? FileManager.default.removeItem(at: url)
+            return
+        }
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try? data.write(to: url, options: [.atomic])
+    }
+}
+
+public struct SyncTextConflictStoreSnapshot: Sendable {
+    fileprivate let conflictsData: Data?
+    fileprivate let resolvedData: Data?
+    fileprivate let queuedData: Data?
 }

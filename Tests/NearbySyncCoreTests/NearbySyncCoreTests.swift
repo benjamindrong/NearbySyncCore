@@ -1397,6 +1397,60 @@ final class NearbySyncCoreTests: XCTestCase {
         XCTAssertEqual(queuedConflict?.conflict.remoteText, "iPhone incoming again")
     }
 
+    func testConflictStoreSnapshotRestoresActiveAndQueuedState() {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let expiresAt = Date().addingTimeInterval(1_000)
+        let firstConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Mac local",
+            remoteText: "iPhone incoming",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            preservedAt: Date(timeIntervalSince1970: 201),
+            expiresAt: expiresAt
+        )
+        let queuedConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Mac local",
+            remoteText: "iPhone incoming again",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 250),
+            preservedAt: Date(timeIntervalSince1970: 251),
+            expiresAt: expiresAt
+        )
+        _ = conflictStore.preserve(firstConflict)
+        _ = conflictStore.preserve(queuedConflict)
+
+        let snapshot = conflictStore.snapshot()
+
+        // Mutate state past the snapshot point.
+        _ = conflictStore.removeConflict(id: firstConflict.id)
+        let thirdConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-2",
+            fieldID: "text",
+            localText: "Mac local 2",
+            remoteText: "iPhone incoming 2",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 300),
+            preservedAt: Date(timeIntervalSince1970: 301),
+            expiresAt: expiresAt
+        )
+        _ = conflictStore.preserve(thirdConflict)
+
+        conflictStore.restore(snapshot)
+
+        let restoredActive = conflictStore.activeConflicts()
+        let restoredQueued = conflictStore.queuedConflict(entityType: .item, entityID: "item-1", fieldID: "text")
+        XCTAssertEqual(restoredActive.map(\.id), [firstConflict.id])
+        XCTAssertEqual(restoredQueued?.conflict.remoteText, "iPhone incoming again")
+    }
+
     func testRemovingResolvedConflictClearsDuplicateEntityFieldConflicts() {
         let conflictURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
