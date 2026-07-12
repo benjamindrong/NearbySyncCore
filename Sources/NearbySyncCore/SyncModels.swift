@@ -833,6 +833,9 @@ public final class SyncTextConflictStore: @unchecked Sendable {
             return activeConflicts()
         }
         let conflicts = activeConflicts()
+        if conflicts.contains(where: { Self.isExactRemoteMatch($0, conflict) }) {
+            return conflicts
+        }
         if conflicts.contains(where: { sameLogicalConflict($0, conflict) }) {
             queue(conflict)
             return conflicts
@@ -948,6 +951,9 @@ public final class SyncTextConflictStore: @unchecked Sendable {
             return try activeConflictsChecked()
         }
         let conflicts = try activeConflictsChecked()
+        if conflicts.contains(where: { Self.isExactRemoteMatch($0, conflict) }) {
+            return conflicts
+        }
         if conflicts.contains(where: { sameLogicalConflict($0, conflict) }) {
             try queueChecked(conflict)
             return conflicts
@@ -1084,13 +1090,20 @@ public final class SyncTextConflictStore: @unchecked Sendable {
         try fileIO.writeData(data, resolvedFileURL)
     }
 
-    private func sameRemoteConflict(_ lhs: SyncTextConflictVersion, _ rhs: SyncTextConflictVersion) -> Bool {
+    public static func isExactRemoteMatch(
+        _ lhs: SyncTextConflictVersion,
+        _ rhs: SyncTextConflictVersion
+    ) -> Bool {
         lhs.entityType == rhs.entityType
             && lhs.entityID == rhs.entityID
             && lhs.fieldID == rhs.fieldID
             && lhs.remoteUpdatedAt == rhs.remoteUpdatedAt
             && lhs.remoteText == rhs.remoteText
             && lhs.remoteData == rhs.remoteData
+    }
+
+    private func sameRemoteConflict(_ lhs: SyncTextConflictVersion, _ rhs: SyncTextConflictVersion) -> Bool {
+        Self.isExactRemoteMatch(lhs, rhs)
     }
 
     private func sameLogicalConflict(_ lhs: SyncTextConflictVersion, _ rhs: SyncTextConflictVersion) -> Bool {

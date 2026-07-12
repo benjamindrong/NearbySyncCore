@@ -1735,6 +1735,74 @@ final class NearbySyncCoreTests: XCTestCase {
         )
     }
 
+    func testPreserveExactRemoteConflictTwiceDoesNotQueueDuplicate() {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let activeConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Local 1",
+            remoteText: "Remote",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            preservedAt: Date(timeIntervalSince1970: 300),
+            expiresAt: Date().addingTimeInterval(1_000)
+        )
+        let redeliveredConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Local 2",
+            remoteText: "Remote",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            preservedAt: Date(timeIntervalSince1970: 400),
+            expiresAt: Date().addingTimeInterval(1_000)
+        )
+
+        _ = conflictStore.preserve(activeConflict)
+        _ = conflictStore.preserve(redeliveredConflict)
+
+        XCTAssertEqual(conflictStore.activeConflicts().map(\.id), [activeConflict.id])
+        XCTAssertNil(conflictStore.queuedConflict(entityType: .item, entityID: "item-1", fieldID: "text"))
+    }
+
+    func testCheckedCommitExactRemoteConflictTwiceDoesNotQueueDuplicate() throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let activeConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Local 1",
+            remoteText: "Remote",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            preservedAt: Date(timeIntervalSince1970: 300),
+            expiresAt: Date().addingTimeInterval(1_000)
+        )
+        let redeliveredConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Local 2",
+            remoteText: "Remote",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            preservedAt: Date(timeIntervalSince1970: 400),
+            expiresAt: Date().addingTimeInterval(1_000)
+        )
+
+        try conflictStore.commitChecked(SyncTextConflictCommitEffects(preservedConflicts: [activeConflict]))
+        try conflictStore.commitChecked(SyncTextConflictCommitEffects(preservedConflicts: [redeliveredConflict]))
+
+        XCTAssertEqual(conflictStore.activeConflicts().map(\.id), [activeConflict.id])
+        XCTAssertNil(conflictStore.queuedConflict(entityType: .item, entityID: "item-1", fieldID: "text"))
+    }
+
     func testRemovingResolvedConflictClearsDuplicateEntityFieldConflicts() {
         let conflictURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
