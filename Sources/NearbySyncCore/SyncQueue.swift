@@ -68,11 +68,22 @@ public actor SyncQueue {
     }
 
     public func markApplied(_ changeID: UUID) {
-        appliedChangeIDs.insert(changeID)
+        try? commitAppliedChangeIDs([changeID])
+    }
+
+    public func commitAppliedChangeIDs(_ changeIDs: [UUID]) throws {
+        let previousAppliedChangeIDs = appliedChangeIDs
+        let previousPendingAcknowledgementIDs = pendingAcknowledgementIDs
+        appliedChangeIDs.formUnion(changeIDs)
         // Applying a remote change never creates a local content change. The
         // only outbound work generated here is metadata saying it was received.
-        pendingAcknowledgementIDs.insert(changeID)
-        persistPendingChanges()
+        pendingAcknowledgementIDs.formUnion(changeIDs)
+        let result = persistPendingChanges()
+        guard result.didPersist else {
+            appliedChangeIDs = previousAppliedChangeIDs
+            pendingAcknowledgementIDs = previousPendingAcknowledgementIDs
+            throw SyncQueueReplacementError.persistenceFailed
+        }
     }
 
     public func markAcknowledgementSent(_ changeIDs: [UUID]) {
@@ -116,10 +127,11 @@ public actor SyncQueue {
         health = .healthy
     }
 
-    private func persistPendingChanges() {
+    @discardableResult
+    private func persistPendingChanges() -> SyncPersistenceResult {
         guard let persistence else {
             health = .healthy
-            return
+            return SyncPersistenceResult(didPersist: true)
         }
 
         let result = persistence.saveSnapshot(currentSnapshot())
@@ -128,6 +140,7 @@ public actor SyncQueue {
         } else {
             health = .readFailed(result.errorDescription ?? "Unknown persistence failure")
         }
+        return result
     }
 
     private func currentSnapshot() -> SyncQueueSnapshot {

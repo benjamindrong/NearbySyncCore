@@ -143,6 +143,25 @@ public struct SyncApplyResult: Equatable, Sendable {
     }
 }
 
+public struct LegacyIncomingEnvelopePreparation: Equatable, Sendable {
+    public let acknowledgedChangeIDs: [UUID]
+    public let acknowledgedLocalChanges: [SyncChange]
+    public let alreadyHandledChangeIDs: Set<UUID>
+    public let candidateChanges: [SyncChange]
+
+    public init(
+        acknowledgedChangeIDs: [UUID],
+        acknowledgedLocalChanges: [SyncChange],
+        alreadyHandledChangeIDs: Set<UUID>,
+        candidateChanges: [SyncChange]
+    ) {
+        self.acknowledgedChangeIDs = acknowledgedChangeIDs
+        self.acknowledgedLocalChanges = acknowledgedLocalChanges
+        self.alreadyHandledChangeIDs = alreadyHandledChangeIDs
+        self.candidateChanges = candidateChanges
+    }
+}
+
 public enum SyncTextConflictAction: String, Codable, Sendable {
     case preserved
     case resolved
