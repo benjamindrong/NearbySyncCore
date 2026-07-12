@@ -1194,7 +1194,7 @@ final class NearbySyncCoreTests: XCTestCase {
             localText: "local",
             remoteText: "remote",
             remoteUpdatedAt: Date(timeIntervalSince1970: 200),
-            expiresAt: Date(timeIntervalSince1970: 1_000)
+            expiresAt: Date().addingTimeInterval(1_000)
         )
         _ = conflictStore.preserve(conflict)
 
@@ -1231,7 +1231,7 @@ final class NearbySyncCoreTests: XCTestCase {
             localText: "current winner",
             remoteText: "incoming",
             remoteUpdatedAt: Date(timeIntervalSince1970: 200),
-            expiresAt: Date(timeIntervalSince1970: 1_000)
+            expiresAt: Date().addingTimeInterval(1_000)
         )
         let payload = try SyncTextConflictPayload(
             action: .resolved,
@@ -1302,7 +1302,7 @@ final class NearbySyncCoreTests: XCTestCase {
             localText: "mac text",
             remoteText: "phone text",
             remoteUpdatedAt: Date(timeIntervalSince1970: 200),
-            expiresAt: Date(timeIntervalSince1970: 1_000)
+            expiresAt: Date().addingTimeInterval(1_000)
         )
         _ = conflictStoreB.preserve(conflict)
         _ = await storeB.removeResolvedConflict(conflict)
@@ -1352,7 +1352,7 @@ final class NearbySyncCoreTests: XCTestCase {
             localText: "current",
             remoteText: "incoming",
             remoteUpdatedAt: Date(timeIntervalSince1970: 200),
-            expiresAt: Date(timeIntervalSince1970: 1_000)
+            expiresAt: Date().addingTimeInterval(1_000)
         )
         _ = conflictStore.preserve(conflict)
 
@@ -1579,6 +1579,160 @@ final class NearbySyncCoreTests: XCTestCase {
                 .restoreFailed(path: conflictURL.path)
             )
         }
+    }
+
+    func testCheckedConflictCommitThrowsWhenActiveConflictWriteFails() {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        let conflictStore = SyncTextConflictStore(
+            fileURL: conflictURL,
+            fileIO: SyncTextConflictStore.FileIO(
+                fileExists: { _ in false },
+                readData: { _ in Data() },
+                createDirectory: { _ in },
+                writeData: { _, _ in throw CocoaError(.fileWriteNoPermission) },
+                removeItem: { _ in }
+            )
+        )
+        let conflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Local",
+            remoteText: "Remote",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            expiresAt: Date().addingTimeInterval(1_000)
+        )
+
+        XCTAssertThrowsError(try conflictStore.commitChecked(SyncTextConflictCommitEffects(
+            preservedConflicts: [conflict]
+        )))
+    }
+
+    func testCheckedConflictCommitThrowsWhenQueuedConflictWriteFails() {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        let directoryURL = conflictURL.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let activeConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Local",
+            remoteText: "Remote 1",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            expiresAt: Date().addingTimeInterval(1_000)
+        )
+        _ = conflictStore.preserve(activeConflict)
+        let failingStore = SyncTextConflictStore(
+            fileURL: conflictURL,
+            fileIO: SyncTextConflictStore.FileIO(
+                fileExists: { FileManager.default.fileExists(atPath: $0) },
+                readData: { try Data(contentsOf: $0) },
+                createDirectory: {
+                    try FileManager.default.createDirectory(at: $0, withIntermediateDirectories: true)
+                },
+                writeData: { data, url in
+                    if url.lastPathComponent == "sync-queued-conflicts.json" {
+                        throw CocoaError(.fileWriteNoPermission)
+                    }
+                    try data.write(to: url, options: [.atomic])
+                },
+                removeItem: { try FileManager.default.removeItem(at: $0) }
+            )
+        )
+        let newerConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Local",
+            remoteText: "Remote 2",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 300),
+            expiresAt: Date().addingTimeInterval(1_000)
+        )
+
+        XCTAssertThrowsError(try failingStore.commitChecked(SyncTextConflictCommitEffects(
+            preservedConflicts: [newerConflict]
+        )))
+        XCTAssertNil(conflictStore.queuedConflict(entityType: .item, entityID: "item-1", fieldID: "text"))
+    }
+
+    func testCheckedConflictCommitThrowsWhenResolvedConflictWriteFails() {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        let directoryURL = conflictURL.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let conflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Local",
+            remoteText: "Remote",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            expiresAt: Date().addingTimeInterval(1_000)
+        )
+        _ = conflictStore.preserve(conflict)
+        let failingStore = SyncTextConflictStore(
+            fileURL: conflictURL,
+            fileIO: SyncTextConflictStore.FileIO(
+                fileExists: { FileManager.default.fileExists(atPath: $0) },
+                readData: { try Data(contentsOf: $0) },
+                createDirectory: {
+                    try FileManager.default.createDirectory(at: $0, withIntermediateDirectories: true)
+                },
+                writeData: { data, url in
+                    if url.lastPathComponent == "sync-resolved-conflicts.json" {
+                        throw CocoaError(.fileWriteNoPermission)
+                    }
+                    try data.write(to: url, options: [.atomic])
+                },
+                removeItem: { try FileManager.default.removeItem(at: $0) }
+            )
+        )
+
+        XCTAssertThrowsError(try failingStore.commitChecked(SyncTextConflictCommitEffects(
+            removedResolvedConflicts: [conflict]
+        )))
+    }
+
+    func testCheckedConflictCommitQueuesSameFieldConflictWithoutDroppingActiveConflict() throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let activeConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Local",
+            remoteText: "Remote 1",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            expiresAt: Date().addingTimeInterval(1_000)
+        )
+        let newerConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Local",
+            remoteText: "Remote 2",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 300),
+            expiresAt: Date().addingTimeInterval(1_000)
+        )
+
+        try conflictStore.commitChecked(SyncTextConflictCommitEffects(preservedConflicts: [activeConflict]))
+        try conflictStore.commitChecked(SyncTextConflictCommitEffects(preservedConflicts: [newerConflict]))
+
+        XCTAssertEqual(conflictStore.activeConflicts().map(\.id), [activeConflict.id])
+        XCTAssertEqual(
+            conflictStore.queuedConflict(entityType: .item, entityID: "item-1", fieldID: "text")?.conflict.id,
+            newerConflict.id
+        )
     }
 
     func testRemovingResolvedConflictClearsDuplicateEntityFieldConflicts() {
