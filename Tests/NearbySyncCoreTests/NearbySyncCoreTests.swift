@@ -1397,7 +1397,7 @@ final class NearbySyncCoreTests: XCTestCase {
         XCTAssertEqual(queuedConflict?.conflict.remoteText, "iPhone incoming again")
     }
 
-    func testConflictStoreSnapshotRestoresActiveAndQueuedState() {
+    func testConflictStoreSnapshotRestoresActiveAndQueuedState() throws {
         let conflictURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
             .appendingPathComponent("sync-conflicts.json")
@@ -1427,7 +1427,7 @@ final class NearbySyncCoreTests: XCTestCase {
         _ = conflictStore.preserve(firstConflict)
         _ = conflictStore.preserve(queuedConflict)
 
-        let snapshot = conflictStore.snapshot()
+        let snapshot = try conflictStore.snapshot()
 
         // Mutate state past the snapshot point.
         _ = conflictStore.removeConflict(id: firstConflict.id)
@@ -1443,12 +1443,142 @@ final class NearbySyncCoreTests: XCTestCase {
         )
         _ = conflictStore.preserve(thirdConflict)
 
-        conflictStore.restore(snapshot)
+        try conflictStore.restore(snapshot)
 
         let restoredActive = conflictStore.activeConflicts()
         let restoredQueued = conflictStore.queuedConflict(entityType: .item, entityID: "item-1", fieldID: "text")
         XCTAssertEqual(restoredActive.map(\.id), [firstConflict.id])
         XCTAssertEqual(restoredQueued?.conflict.remoteText, "iPhone incoming again")
+    }
+
+    func testConflictStoreSnapshotCapturesMissingFilesAsAbsentAndRestoresByRemoving() throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        let directoryURL = conflictURL.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+        let resolvedURL = directoryURL.appendingPathComponent("sync-resolved-conflicts.json")
+        let queuedURL = directoryURL.appendingPathComponent("sync-queued-conflicts.json")
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+
+        let snapshot = try conflictStore.snapshot()
+
+        XCTAssertEqual(snapshot.conflicts, .absent)
+        XCTAssertEqual(snapshot.resolved, .absent)
+        XCTAssertEqual(snapshot.queued, .absent)
+
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        try Data("active".utf8).write(to: conflictURL)
+        try Data("resolved".utf8).write(to: resolvedURL)
+        try Data("queued".utf8).write(to: queuedURL)
+
+        try conflictStore.restore(snapshot)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: conflictURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: resolvedURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: queuedURL.path))
+    }
+
+    func testConflictStoreSnapshotRestoresPresentFilesWithExactBytes() throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        let directoryURL = conflictURL.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+        let resolvedURL = directoryURL.appendingPathComponent("sync-resolved-conflicts.json")
+        let queuedURL = directoryURL.appendingPathComponent("sync-queued-conflicts.json")
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        try Data([0, 1, 2]).write(to: conflictURL)
+        try Data([3, 4, 5]).write(to: resolvedURL)
+        try Data([6, 7, 8]).write(to: queuedURL)
+
+        let snapshot = try conflictStore.snapshot()
+
+        try Data("mutated-active".utf8).write(to: conflictURL)
+        try Data("mutated-resolved".utf8).write(to: resolvedURL)
+        try Data("mutated-queued".utf8).write(to: queuedURL)
+        try conflictStore.restore(snapshot)
+
+        XCTAssertEqual(try Data(contentsOf: conflictURL), Data([0, 1, 2]))
+        XCTAssertEqual(try Data(contentsOf: resolvedURL), Data([3, 4, 5]))
+        XCTAssertEqual(try Data(contentsOf: queuedURL), Data([6, 7, 8]))
+    }
+
+    func testConflictStoreSnapshotThrowsWhenExistingFileCannotBeRead() throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        let conflictStore = SyncTextConflictStore(
+            fileURL: conflictURL,
+            fileIO: SyncTextConflictStore.FileIO(
+                fileExists: { _ in true },
+                readData: { _ in throw CocoaError(.fileReadNoPermission) },
+                createDirectory: { _ in },
+                writeData: { _, _ in },
+                removeItem: { _ in }
+            )
+        )
+
+        XCTAssertThrowsError(try conflictStore.snapshot()) { error in
+            XCTAssertEqual(
+                error as? SyncTextConflictStoreSnapshotError,
+                .captureFailed(path: conflictURL.path)
+            )
+        }
+    }
+
+    func testConflictStoreRestoreThrowsWhenPresentFileCannotBeWritten() {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        let conflictStore = SyncTextConflictStore(
+            fileURL: conflictURL,
+            fileIO: SyncTextConflictStore.FileIO(
+                fileExists: { _ in false },
+                readData: { _ in Data() },
+                createDirectory: { _ in },
+                writeData: { _, _ in throw CocoaError(.fileWriteNoPermission) },
+                removeItem: { _ in }
+            )
+        )
+        let snapshot = SyncTextConflictStoreSnapshot(
+            conflicts: .present(Data("active".utf8)),
+            resolved: .absent,
+            queued: .absent
+        )
+
+        XCTAssertThrowsError(try conflictStore.restore(snapshot)) { error in
+            XCTAssertEqual(
+                error as? SyncTextConflictStoreSnapshotError,
+                .restoreFailed(path: conflictURL.path)
+            )
+        }
+    }
+
+    func testConflictStoreRestoreThrowsWhenAbsentFileCannotBeRemoved() {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        let conflictStore = SyncTextConflictStore(
+            fileURL: conflictURL,
+            fileIO: SyncTextConflictStore.FileIO(
+                fileExists: { _ in true },
+                readData: { _ in Data() },
+                createDirectory: { _ in },
+                writeData: { _, _ in },
+                removeItem: { _ in throw CocoaError(.fileWriteNoPermission) }
+            )
+        )
+        let snapshot = SyncTextConflictStoreSnapshot(conflicts: .absent, resolved: .absent, queued: .absent)
+
+        XCTAssertThrowsError(try conflictStore.restore(snapshot)) { error in
+            XCTAssertEqual(
+                error as? SyncTextConflictStoreSnapshotError,
+                .restoreFailed(path: conflictURL.path)
+            )
+        }
     }
 
     func testRemovingResolvedConflictClearsDuplicateEntityFieldConflicts() {

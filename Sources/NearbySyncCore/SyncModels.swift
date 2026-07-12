@@ -752,12 +752,39 @@ public struct SyncTextQueuedConflict: Codable, Equatable, Sendable {
 }
 
 public final class SyncTextConflictStore: @unchecked Sendable {
+    struct FileIO: Sendable {
+        var fileExists: @Sendable (String) -> Bool
+        var readData: @Sendable (URL) throws -> Data
+        var createDirectory: @Sendable (URL) throws -> Void
+        var writeData: @Sendable (Data, URL) throws -> Void
+        var removeItem: @Sendable (URL) throws -> Void
+
+        static let live = FileIO(
+            fileExists: { FileManager.default.fileExists(atPath: $0) },
+            readData: { try Data(contentsOf: $0) },
+            createDirectory: {
+                try FileManager.default.createDirectory(
+                    at: $0,
+                    withIntermediateDirectories: true
+                )
+            },
+            writeData: { data, url in try data.write(to: url, options: [.atomic]) },
+            removeItem: { try FileManager.default.removeItem(at: $0) }
+        )
+    }
+
     private let fileURL: URL
+    private let fileIO: FileIO
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
 
-    public init(fileURL: URL) {
+    public convenience init(fileURL: URL) {
+        self.init(fileURL: fileURL, fileIO: .live)
+    }
+
+    init(fileURL: URL, fileIO: FileIO) {
         self.fileURL = fileURL
+        self.fileIO = fileIO
     }
 
     public func activeConflicts(now: Date = Date()) -> [SyncTextConflictVersion] {
@@ -992,37 +1019,62 @@ public final class SyncTextConflictStore: @unchecked Sendable {
     /// conflict state. Intended for callers that must speculatively apply an
     /// incoming change (which may write conflict metadata as a side effect)
     /// and roll back that write if a separate, later persistence step fails.
-    public func snapshot() -> SyncTextConflictStoreSnapshot {
+    public func snapshot() throws -> SyncTextConflictStoreSnapshot {
         SyncTextConflictStoreSnapshot(
-            conflictsData: try? Data(contentsOf: fileURL),
-            resolvedData: try? Data(contentsOf: resolvedFileURL),
-            queuedData: try? Data(contentsOf: queuedFileURL)
+            conflicts: try snapshotState(for: fileURL),
+            resolved: try snapshotState(for: resolvedFileURL),
+            queued: try snapshotState(for: queuedFileURL)
         )
     }
 
     /// Restores exactly the on-disk bytes captured by `snapshot()`, including
     /// removing a file that did not exist at snapshot time.
-    public func restore(_ snapshot: SyncTextConflictStoreSnapshot) {
-        Self.writeOrRemove(snapshot.conflictsData, to: fileURL)
-        Self.writeOrRemove(snapshot.resolvedData, to: resolvedFileURL)
-        Self.writeOrRemove(snapshot.queuedData, to: queuedFileURL)
+    public func restore(_ snapshot: SyncTextConflictStoreSnapshot) throws {
+        try restore(snapshot.conflicts, to: fileURL)
+        try restore(snapshot.resolved, to: resolvedFileURL)
+        try restore(snapshot.queued, to: queuedFileURL)
     }
 
-    private static func writeOrRemove(_ data: Data?, to url: URL) {
-        guard let data else {
-            try? FileManager.default.removeItem(at: url)
-            return
+    private func snapshotState(for url: URL) throws -> SyncFileSnapshotState {
+        guard fileIO.fileExists(url.path) else {
+            return .absent
         }
-        try? FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try? data.write(to: url, options: [.atomic])
+        do {
+            return .present(try fileIO.readData(url))
+        } catch {
+            throw SyncTextConflictStoreSnapshotError.captureFailed(path: url.path)
+        }
+    }
+
+    private func restore(_ state: SyncFileSnapshotState, to url: URL) throws {
+        do {
+            switch state {
+            case .absent:
+                if fileIO.fileExists(url.path) {
+                    try fileIO.removeItem(url)
+                }
+            case .present(let data):
+                try fileIO.createDirectory(url.deletingLastPathComponent())
+                try fileIO.writeData(data, url)
+            }
+        } catch {
+            throw SyncTextConflictStoreSnapshotError.restoreFailed(path: url.path)
+        }
     }
 }
 
-public struct SyncTextConflictStoreSnapshot: Sendable {
-    fileprivate let conflictsData: Data?
-    fileprivate let resolvedData: Data?
-    fileprivate let queuedData: Data?
+public enum SyncFileSnapshotState: Sendable, Equatable {
+    case absent
+    case present(Data)
+}
+
+public enum SyncTextConflictStoreSnapshotError: Error, Equatable {
+    case captureFailed(path: String)
+    case restoreFailed(path: String)
+}
+
+public struct SyncTextConflictStoreSnapshot: Sendable, Equatable {
+    public let conflicts: SyncFileSnapshotState
+    public let resolved: SyncFileSnapshotState
+    public let queued: SyncFileSnapshotState
 }
