@@ -68,9 +68,13 @@ public actor SyncQueue {
     }
 
     public func markApplied(_ changeID: UUID) {
-        try? commitAppliedChangeIDs([changeID])
+        commitAppliedChangeIDsBestEffort([changeID])
     }
 
+    /// Strict two-phase commit. Persists handled and pending-acknowledgement
+    /// state atomically; rolls back both in-memory sets and throws if
+    /// persistence fails, so the caller must not acknowledge the change and
+    /// redelivery will present it as a candidate again.
     public func commitAppliedChangeIDs(_ changeIDs: [UUID]) throws {
         let previousAppliedChangeIDs = appliedChangeIDs
         let previousPendingAcknowledgementIDs = pendingAcknowledgementIDs
@@ -82,8 +86,20 @@ public actor SyncQueue {
         guard result.didPersist else {
             appliedChangeIDs = previousAppliedChangeIDs
             pendingAcknowledgementIDs = previousPendingAcknowledgementIDs
-            throw SyncQueueReplacementError.persistenceFailed
+            throw SyncHandledStateCommitError.persistenceFailed
         }
+    }
+
+    /// Compatibility best-effort commit for `applyIncomingEnvelope(_:)` and
+    /// other legacy consumers that do not observe a thrown error. Unlike
+    /// `commitAppliedChangeIDs(_:)`, in-memory handled/pending-acknowledgement
+    /// state is retained even when persistence fails, matching the previous
+    /// `markApplied(_:)` behavior. Persistence failure is surfaced only
+    /// through `persistenceHealth()`.
+    public func commitAppliedChangeIDsBestEffort(_ changeIDs: [UUID]) {
+        appliedChangeIDs.formUnion(changeIDs)
+        pendingAcknowledgementIDs.formUnion(changeIDs)
+        persistPendingChanges()
     }
 
     public func markAcknowledgementSent(_ changeIDs: [UUID]) {
@@ -183,6 +199,12 @@ public struct SyncQueuePersistenceLoadResult: Equatable, Sendable {
 public enum SyncQueueReplacementError: Error, Equatable {
     case persistenceFailed
     case unhealthyPersistence
+}
+
+/// Thrown by the strict `commitAppliedChangeIDs(_:)` two-phase commit when
+/// handled/pending-acknowledgement state cannot be durably persisted.
+public enum SyncHandledStateCommitError: Error, Equatable {
+    case persistenceFailed
 }
 
 public struct SyncQueueSnapshot: Codable, Equatable, Sendable {

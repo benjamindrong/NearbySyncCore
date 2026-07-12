@@ -1745,6 +1745,306 @@ final class NearbySyncCoreTests: XCTestCase {
         XCTAssertEqual(envelope.changes.first?.payload, Data("payload-100".utf8))
     }
 
+    // MARK: - Two-phase legacy receive (prepare / commit)
+
+    func testPrepareIncomingEnvelopeDoesNotMarkCandidateHandled() async throws {
+        let queue = SyncQueue()
+        let engine = SyncEngine(deviceID: "device-b", store: InMemorySyncStore(), queue: queue)
+        let change = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: Data("payload".utf8),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            originDeviceID: "device-a"
+        )
+        let envelope = SyncEnvelope(senderDeviceID: "device-a", changes: [change])
+
+        let preparation = await engine.prepareIncomingEnvelope(envelope)
+
+        XCTAssertEqual(preparation.candidateChanges, [change])
+        XCTAssertTrue(preparation.alreadyHandledChangeIDs.isEmpty)
+        let hasApplied = await queue.hasApplied(change.id)
+        XCTAssertFalse(hasApplied)
+        let pendingAcknowledgementIDs = await queue.acknowledgementBatch()
+        XCTAssertFalse(pendingAcknowledgementIDs.contains(change.id))
+    }
+
+    func testStrictCommitPersistsHandledStateAcrossRestart() async throws {
+        let fileURL = temporaryQueueURL()
+        defer { try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent()) }
+        let change = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: Data("payload".utf8),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            originDeviceID: "device-a"
+        )
+        let firstEngine = SyncEngine(
+            deviceID: "device-b",
+            store: InMemorySyncStore(),
+            queue: SyncQueue(persistence: FileBackedSyncQueuePersistence(fileURL: fileURL))
+        )
+        let firstPreparation = await firstEngine.prepareIncomingEnvelope(
+            SyncEnvelope(senderDeviceID: "device-a", changes: [change])
+        )
+        try await firstEngine.commitHandledIncomingChanges(Set(firstPreparation.candidateChanges.map(\.id)))
+
+        let restartedEngine = SyncEngine(
+            deviceID: "device-b",
+            store: InMemorySyncStore(),
+            queue: SyncQueue(persistence: FileBackedSyncQueuePersistence(fileURL: fileURL))
+        )
+        let secondPreparation = await restartedEngine.prepareIncomingEnvelope(
+            SyncEnvelope(senderDeviceID: "device-a", changes: [change])
+        )
+
+        XCTAssertTrue(secondPreparation.candidateChanges.isEmpty)
+        XCTAssertEqual(secondPreparation.alreadyHandledChangeIDs, [change.id])
+    }
+
+    func testStrictCommitFailureRollsBackAndThrows() async throws {
+        let queue = SyncQueue(
+            persistence: FailingSyncQueuePersistence(
+                loadResult: SyncQueuePersistenceLoadResult(snapshot: SyncQueueSnapshot(), health: .healthy)
+            )
+        )
+        let engine = SyncEngine(deviceID: "device-b", store: InMemorySyncStore(), queue: queue)
+        let change = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: Data("payload".utf8),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            originDeviceID: "device-a"
+        )
+        let preparation = await engine.prepareIncomingEnvelope(
+            SyncEnvelope(senderDeviceID: "device-a", changes: [change])
+        )
+
+        do {
+            try await engine.commitHandledIncomingChanges(Set(preparation.candidateChanges.map(\.id)))
+            XCTFail("Expected strict commit to throw")
+        } catch {
+            XCTAssertEqual(error as? SyncHandledStateCommitError, .persistenceFailed)
+        }
+
+        let hasApplied = await queue.hasApplied(change.id)
+        XCTAssertFalse(hasApplied)
+        let pendingAcknowledgementIDs = await queue.acknowledgementBatch()
+        XCTAssertFalse(pendingAcknowledgementIDs.contains(change.id))
+
+        let redeliveredPreparation = await engine.prepareIncomingEnvelope(
+            SyncEnvelope(senderDeviceID: "device-a", changes: [change])
+        )
+        XCTAssertEqual(redeliveredPreparation.candidateChanges, [change])
+    }
+
+    func testCompatibilityWrapperMarksAppliedCandidateTerminal() async throws {
+        let queue = SyncQueue()
+        let engine = SyncEngine(deviceID: "device-b", store: InMemorySyncStore(), queue: queue)
+        let change = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: Data("payload".utf8),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            originDeviceID: "device-a"
+        )
+
+        let result = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-a", changes: [change]))
+
+        XCTAssertEqual(result.appliedChangeIDs, [change.id])
+        let hasApplied = await queue.hasApplied(change.id)
+        XCTAssertTrue(hasApplied)
+        let pendingAcknowledgementIDs = await queue.acknowledgementBatch()
+        XCTAssertTrue(pendingAcknowledgementIDs.contains(change.id))
+
+        let redelivered = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-a", changes: [change]))
+        XCTAssertEqual(redelivered.ignoredDuplicateIDs, [change.id])
+    }
+
+    /// Regression test: the compatibility wrapper must treat a store-rejected
+    /// stale change as terminal, the same as the pre-two-phase implementation.
+    /// Otherwise a deterministically stale change is redelivered forever and
+    /// never classifies as a duplicate.
+    func testCompatibilityWrapperMarksStaleCandidateTerminal() async throws {
+        let queue = SyncQueue()
+        let store = InMemorySyncStore(seedRecords: [
+            SyncRecord(
+                entityType: .item,
+                entityID: "item-1",
+                payload: Data("newer".utf8),
+                updatedAt: Date(timeIntervalSince1970: 200)
+            )
+        ])
+        let engine = SyncEngine(deviceID: "device-b", store: store, queue: queue)
+        let staleChange = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: Data("older".utf8),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            originDeviceID: "device-a"
+        )
+
+        let result = await engine.applyIncomingEnvelope(
+            SyncEnvelope(senderDeviceID: "device-a", changes: [staleChange])
+        )
+
+        XCTAssertEqual(result.ignoredStaleIDs, [staleChange.id])
+        XCTAssertTrue(result.appliedChangeIDs.isEmpty)
+        let hasApplied = await queue.hasApplied(staleChange.id)
+        XCTAssertTrue(
+            hasApplied,
+            "A deterministically stale change must still be committed as handled so it becomes terminal."
+        )
+        let pendingAcknowledgementIDs = await queue.acknowledgementBatch()
+        XCTAssertTrue(pendingAcknowledgementIDs.contains(staleChange.id))
+
+        let redelivered = await engine.applyIncomingEnvelope(
+            SyncEnvelope(senderDeviceID: "device-a", changes: [staleChange])
+        )
+        XCTAssertEqual(redelivered.ignoredDuplicateIDs, [staleChange.id])
+        XCTAssertTrue(
+            redelivered.ignoredStaleIDs.isEmpty,
+            "Redelivery of a terminal stale change must classify as duplicate, not stale again."
+        )
+    }
+
+    func testCompatibilityPersistenceFailureRetainsHandledStateAndDegradesHealth() async throws {
+        let persistence = FailingSyncQueuePersistence(
+            loadResult: SyncQueuePersistenceLoadResult(snapshot: SyncQueueSnapshot(), health: .healthy)
+        )
+        let queue = SyncQueue(persistence: persistence)
+        let engine = SyncEngine(deviceID: "device-b", store: InMemorySyncStore(), queue: queue)
+        let change = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: Data("payload".utf8),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            originDeviceID: "device-a"
+        )
+
+        let result = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-a", changes: [change]))
+
+        XCTAssertEqual(result.appliedChangeIDs, [change.id])
+        let hasApplied = await queue.hasApplied(change.id)
+        XCTAssertTrue(
+            hasApplied,
+            "Compatibility commit must retain in-memory handled state even when persistence fails"
+        )
+        let pendingAcknowledgementIDs = await queue.acknowledgementBatch()
+        XCTAssertTrue(pendingAcknowledgementIDs.contains(change.id))
+        if case .readFailed = await queue.persistenceHealth() {
+            // Expected.
+        } else {
+            XCTFail("Expected persistence failure to degrade queue health")
+        }
+    }
+
+    func testPrepareIncomingEnvelopeExcludesDurableDuplicateFromCandidates() async throws {
+        let queue = SyncQueue()
+        let engine = SyncEngine(deviceID: "device-b", store: InMemorySyncStore(), queue: queue)
+        let change = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: Data("payload".utf8),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            originDeviceID: "device-a"
+        )
+        let envelope = SyncEnvelope(senderDeviceID: "device-a", changes: [change])
+        let firstPreparation = await engine.prepareIncomingEnvelope(envelope)
+        try await engine.commitHandledIncomingChanges(Set(firstPreparation.candidateChanges.map(\.id)))
+
+        let secondPreparation = await engine.prepareIncomingEnvelope(envelope)
+
+        XCTAssertEqual(secondPreparation.alreadyHandledChangeIDs, [change.id])
+        XCTAssertTrue(secondPreparation.candidateChanges.isEmpty)
+    }
+
+    func testPrepareIncomingEnvelopeMixedBehaviorPreservesEachCategory() async throws {
+        let queue = SyncQueue()
+        let store = InMemorySyncStore(seedRecords: [
+            SyncRecord(
+                entityType: .item,
+                entityID: "stale-item",
+                payload: Data("newer".utf8),
+                updatedAt: Date(timeIntervalSince1970: 200)
+            )
+        ])
+        let engine = SyncEngine(deviceID: "device-b", store: store, queue: queue)
+
+        let localChange = await engine.recordLocalChange(
+            entityType: .collection,
+            entityID: "collection-1",
+            payload: Data("Inbox".utf8),
+            updatedAt: Date(timeIntervalSince1970: 50)
+        )
+
+        let duplicateChange = SyncChange(
+            entityType: .item,
+            entityID: "item-duplicate",
+            operation: .upsert,
+            payload: Data("payload".utf8),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            originDeviceID: "device-a"
+        )
+        let firstDuplicatePreparation = await engine.prepareIncomingEnvelope(
+            SyncEnvelope(senderDeviceID: "device-a", changes: [duplicateChange])
+        )
+        try await engine.commitHandledIncomingChanges(Set(firstDuplicatePreparation.candidateChanges.map(\.id)))
+
+        let newChange = SyncChange(
+            entityType: .item,
+            entityID: "item-new",
+            operation: .upsert,
+            payload: Data("new".utf8),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            originDeviceID: "device-a"
+        )
+        let staleChange = SyncChange(
+            entityType: .item,
+            entityID: "stale-item",
+            operation: .upsert,
+            payload: Data("older".utf8),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            originDeviceID: "device-a"
+        )
+
+        let mixedEnvelope = SyncEnvelope(
+            senderDeviceID: "device-a",
+            changes: [duplicateChange, newChange, staleChange],
+            acknowledgedChangeIDs: [localChange.id]
+        )
+
+        let preparation = await engine.prepareIncomingEnvelope(mixedEnvelope)
+
+        XCTAssertEqual(preparation.acknowledgedLocalChanges.map(\.id), [localChange.id])
+        XCTAssertEqual(preparation.alreadyHandledChangeIDs, [duplicateChange.id])
+        XCTAssertEqual(Set(preparation.candidateChanges.map(\.id)), [newChange.id, staleChange.id])
+
+        var handledChangeIDs: Set<UUID> = []
+        var appliedChangeIDs: Set<UUID> = []
+        var staleChangeIDs: Set<UUID> = []
+        for change in preparation.candidateChanges {
+            let didApply = await store.apply(change)
+            if didApply {
+                appliedChangeIDs.insert(change.id)
+            } else {
+                staleChangeIDs.insert(change.id)
+            }
+            handledChangeIDs.insert(change.id)
+        }
+        try await engine.commitHandledIncomingChanges(handledChangeIDs)
+
+        XCTAssertEqual(appliedChangeIDs, [newChange.id])
+        XCTAssertEqual(staleChangeIDs, [staleChange.id])
+    }
+
     private func temporaryQueueURL() -> URL {
         FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
