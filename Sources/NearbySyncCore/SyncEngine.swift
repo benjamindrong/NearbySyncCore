@@ -56,23 +56,49 @@ public final class SyncEngine: @unchecked Sendable {
         return acknowledgedLocalChanges
     }
 
-    public func applyIncomingEnvelope(_ envelope: SyncEnvelope) async -> SyncApplyResult {
+    public func prepareIncomingEnvelope(_ envelope: SyncEnvelope) async -> LegacyIncomingEnvelopePreparation {
         // Ack metadata is terminal queue state. It is processed before content
         // so a mixed envelope can clear old sends even if new changes are stale.
         let acknowledgedLocalChanges = await acknowledgeChanges(envelope.acknowledgedChangeIDs)
 
-        var result = SyncApplyResult(
-            acknowledgedChangeIDs: envelope.acknowledgedChangeIDs,
-            acknowledgedLocalChanges: acknowledgedLocalChanges
-        )
+        var alreadyHandledChangeIDs: Set<UUID> = []
+        var candidateChanges: [SyncChange] = []
 
         for change in envelope.changes.sorted(by: syncApplyOrder) {
             if await queue.hasApplied(change.id) {
-                result.ignoredDuplicateIDs.append(change.id)
+                alreadyHandledChangeIDs.insert(change.id)
                 continue
             }
+            candidateChanges.append(change)
+        }
 
-            await queue.markApplied(change.id)
+        return LegacyIncomingEnvelopePreparation(
+            acknowledgedChangeIDs: envelope.acknowledgedChangeIDs,
+            acknowledgedLocalChanges: acknowledgedLocalChanges,
+            alreadyHandledChangeIDs: alreadyHandledChangeIDs,
+            candidateChanges: candidateChanges
+        )
+    }
+
+    public func commitHandledIncomingChanges(_ changeIDs: Set<UUID>) async throws {
+        try await queue.commitAppliedChangeIDs(Array(changeIDs))
+    }
+
+    public func applyIncomingEnvelope(_ envelope: SyncEnvelope) async -> SyncApplyResult {
+        let preparation = await prepareIncomingEnvelope(envelope)
+
+        var result = SyncApplyResult(
+            ignoredDuplicateIDs: Array(preparation.alreadyHandledChangeIDs),
+            acknowledgedChangeIDs: preparation.acknowledgedChangeIDs,
+            acknowledgedLocalChanges: preparation.acknowledgedLocalChanges
+        )
+
+        // Every fully processed candidate is terminal here, whether the store
+        // applied it or rejected it as stale: the legacy compatibility API has
+        // no way to ask the host to reconsider a stale change, so leaving it
+        // unhandled would redeliver it forever instead of converging.
+        var handledChangeIDs: Set<UUID> = []
+        for change in preparation.candidateChanges {
             // Store application is deliberately one-way. If a host app wants to
             // publish a follow-up edit, it must call recordLocalChange itself.
             let didApply = await store.apply(change)
@@ -84,7 +110,14 @@ public final class SyncEngine: @unchecked Sendable {
             } else {
                 result.ignoredStaleIDs.append(change.id)
             }
+            handledChangeIDs.insert(change.id)
         }
+        // Best-effort commit: this compatibility API has no thrown-error
+        // surface, so persistence failure is retained in memory and exposed
+        // only through queuePersistenceHealth(), matching prior markApplied
+        // behavior rather than rolling back and silently discarding a change
+        // this call already reported as applied/stale to the caller.
+        await queue.commitAppliedChangeIDsBestEffort(Array(handledChangeIDs))
 
         return result
     }

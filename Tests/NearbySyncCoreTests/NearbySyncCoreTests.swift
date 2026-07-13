@@ -1194,7 +1194,7 @@ final class NearbySyncCoreTests: XCTestCase {
             localText: "local",
             remoteText: "remote",
             remoteUpdatedAt: Date(timeIntervalSince1970: 200),
-            expiresAt: Date(timeIntervalSince1970: 1_000)
+            expiresAt: Date().addingTimeInterval(1_000)
         )
         _ = conflictStore.preserve(conflict)
 
@@ -1231,7 +1231,7 @@ final class NearbySyncCoreTests: XCTestCase {
             localText: "current winner",
             remoteText: "incoming",
             remoteUpdatedAt: Date(timeIntervalSince1970: 200),
-            expiresAt: Date(timeIntervalSince1970: 1_000)
+            expiresAt: Date().addingTimeInterval(1_000)
         )
         let payload = try SyncTextConflictPayload(
             action: .resolved,
@@ -1302,7 +1302,7 @@ final class NearbySyncCoreTests: XCTestCase {
             localText: "mac text",
             remoteText: "phone text",
             remoteUpdatedAt: Date(timeIntervalSince1970: 200),
-            expiresAt: Date(timeIntervalSince1970: 1_000)
+            expiresAt: Date().addingTimeInterval(1_000)
         )
         _ = conflictStoreB.preserve(conflict)
         _ = await storeB.removeResolvedConflict(conflict)
@@ -1352,7 +1352,7 @@ final class NearbySyncCoreTests: XCTestCase {
             localText: "current",
             remoteText: "incoming",
             remoteUpdatedAt: Date(timeIntervalSince1970: 200),
-            expiresAt: Date(timeIntervalSince1970: 1_000)
+            expiresAt: Date().addingTimeInterval(1_000)
         )
         _ = conflictStore.preserve(conflict)
 
@@ -1395,6 +1395,412 @@ final class NearbySyncCoreTests: XCTestCase {
         XCTAssertEqual(conflicts.count, 1)
         XCTAssertEqual(conflicts.first?.remoteText, "iPhone incoming")
         XCTAssertEqual(queuedConflict?.conflict.remoteText, "iPhone incoming again")
+    }
+
+    func testConflictStoreSnapshotRestoresActiveAndQueuedState() throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let expiresAt = Date().addingTimeInterval(1_000)
+        let firstConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Mac local",
+            remoteText: "iPhone incoming",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            preservedAt: Date(timeIntervalSince1970: 201),
+            expiresAt: expiresAt
+        )
+        let queuedConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Mac local",
+            remoteText: "iPhone incoming again",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 250),
+            preservedAt: Date(timeIntervalSince1970: 251),
+            expiresAt: expiresAt
+        )
+        _ = conflictStore.preserve(firstConflict)
+        _ = conflictStore.preserve(queuedConflict)
+
+        let snapshot = try conflictStore.snapshot()
+
+        // Mutate state past the snapshot point.
+        _ = conflictStore.removeConflict(id: firstConflict.id)
+        let thirdConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-2",
+            fieldID: "text",
+            localText: "Mac local 2",
+            remoteText: "iPhone incoming 2",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 300),
+            preservedAt: Date(timeIntervalSince1970: 301),
+            expiresAt: expiresAt
+        )
+        _ = conflictStore.preserve(thirdConflict)
+
+        try conflictStore.restore(snapshot)
+
+        let restoredActive = conflictStore.activeConflicts()
+        let restoredQueued = conflictStore.queuedConflict(entityType: .item, entityID: "item-1", fieldID: "text")
+        XCTAssertEqual(restoredActive.map(\.id), [firstConflict.id])
+        XCTAssertEqual(restoredQueued?.conflict.remoteText, "iPhone incoming again")
+    }
+
+    func testConflictStoreSnapshotCapturesMissingFilesAsAbsentAndRestoresByRemoving() throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        let directoryURL = conflictURL.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+        let resolvedURL = directoryURL.appendingPathComponent("sync-resolved-conflicts.json")
+        let queuedURL = directoryURL.appendingPathComponent("sync-queued-conflicts.json")
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+
+        let snapshot = try conflictStore.snapshot()
+
+        XCTAssertEqual(snapshot.conflicts, .absent)
+        XCTAssertEqual(snapshot.resolved, .absent)
+        XCTAssertEqual(snapshot.queued, .absent)
+
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        try Data("active".utf8).write(to: conflictURL)
+        try Data("resolved".utf8).write(to: resolvedURL)
+        try Data("queued".utf8).write(to: queuedURL)
+
+        try conflictStore.restore(snapshot)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: conflictURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: resolvedURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: queuedURL.path))
+    }
+
+    func testConflictStoreSnapshotRestoresPresentFilesWithExactBytes() throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        let directoryURL = conflictURL.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+        let resolvedURL = directoryURL.appendingPathComponent("sync-resolved-conflicts.json")
+        let queuedURL = directoryURL.appendingPathComponent("sync-queued-conflicts.json")
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        try Data([0, 1, 2]).write(to: conflictURL)
+        try Data([3, 4, 5]).write(to: resolvedURL)
+        try Data([6, 7, 8]).write(to: queuedURL)
+
+        let snapshot = try conflictStore.snapshot()
+
+        try Data("mutated-active".utf8).write(to: conflictURL)
+        try Data("mutated-resolved".utf8).write(to: resolvedURL)
+        try Data("mutated-queued".utf8).write(to: queuedURL)
+        try conflictStore.restore(snapshot)
+
+        XCTAssertEqual(try Data(contentsOf: conflictURL), Data([0, 1, 2]))
+        XCTAssertEqual(try Data(contentsOf: resolvedURL), Data([3, 4, 5]))
+        XCTAssertEqual(try Data(contentsOf: queuedURL), Data([6, 7, 8]))
+    }
+
+    func testConflictStoreSnapshotThrowsWhenExistingFileCannotBeRead() throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        let conflictStore = SyncTextConflictStore(
+            fileURL: conflictURL,
+            fileIO: SyncTextConflictStore.FileIO(
+                fileExists: { _ in true },
+                readData: { _ in throw CocoaError(.fileReadNoPermission) },
+                createDirectory: { _ in },
+                writeData: { _, _ in },
+                removeItem: { _ in }
+            )
+        )
+
+        XCTAssertThrowsError(try conflictStore.snapshot()) { error in
+            XCTAssertEqual(
+                error as? SyncTextConflictStoreSnapshotError,
+                .captureFailed(path: conflictURL.path)
+            )
+        }
+    }
+
+    func testConflictStoreRestoreThrowsWhenPresentFileCannotBeWritten() {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        let conflictStore = SyncTextConflictStore(
+            fileURL: conflictURL,
+            fileIO: SyncTextConflictStore.FileIO(
+                fileExists: { _ in false },
+                readData: { _ in Data() },
+                createDirectory: { _ in },
+                writeData: { _, _ in throw CocoaError(.fileWriteNoPermission) },
+                removeItem: { _ in }
+            )
+        )
+        let snapshot = SyncTextConflictStoreSnapshot(
+            conflicts: .present(Data("active".utf8)),
+            resolved: .absent,
+            queued: .absent
+        )
+
+        XCTAssertThrowsError(try conflictStore.restore(snapshot)) { error in
+            XCTAssertEqual(
+                error as? SyncTextConflictStoreSnapshotError,
+                .restoreFailed(path: conflictURL.path)
+            )
+        }
+    }
+
+    func testConflictStoreRestoreThrowsWhenAbsentFileCannotBeRemoved() {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        let conflictStore = SyncTextConflictStore(
+            fileURL: conflictURL,
+            fileIO: SyncTextConflictStore.FileIO(
+                fileExists: { _ in true },
+                readData: { _ in Data() },
+                createDirectory: { _ in },
+                writeData: { _, _ in },
+                removeItem: { _ in throw CocoaError(.fileWriteNoPermission) }
+            )
+        )
+        let snapshot = SyncTextConflictStoreSnapshot(conflicts: .absent, resolved: .absent, queued: .absent)
+
+        XCTAssertThrowsError(try conflictStore.restore(snapshot)) { error in
+            XCTAssertEqual(
+                error as? SyncTextConflictStoreSnapshotError,
+                .restoreFailed(path: conflictURL.path)
+            )
+        }
+    }
+
+    func testCheckedConflictCommitThrowsWhenActiveConflictWriteFails() {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        let conflictStore = SyncTextConflictStore(
+            fileURL: conflictURL,
+            fileIO: SyncTextConflictStore.FileIO(
+                fileExists: { _ in false },
+                readData: { _ in Data() },
+                createDirectory: { _ in },
+                writeData: { _, _ in throw CocoaError(.fileWriteNoPermission) },
+                removeItem: { _ in }
+            )
+        )
+        let conflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Local",
+            remoteText: "Remote",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            expiresAt: Date().addingTimeInterval(1_000)
+        )
+
+        XCTAssertThrowsError(try conflictStore.commitChecked(SyncTextConflictCommitEffects(
+            preservedConflicts: [conflict]
+        )))
+    }
+
+    func testCheckedConflictCommitThrowsWhenQueuedConflictWriteFails() {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        let directoryURL = conflictURL.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let activeConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Local",
+            remoteText: "Remote 1",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            expiresAt: Date().addingTimeInterval(1_000)
+        )
+        _ = conflictStore.preserve(activeConflict)
+        let failingStore = SyncTextConflictStore(
+            fileURL: conflictURL,
+            fileIO: SyncTextConflictStore.FileIO(
+                fileExists: { FileManager.default.fileExists(atPath: $0) },
+                readData: { try Data(contentsOf: $0) },
+                createDirectory: {
+                    try FileManager.default.createDirectory(at: $0, withIntermediateDirectories: true)
+                },
+                writeData: { data, url in
+                    if url.lastPathComponent == "sync-queued-conflicts.json" {
+                        throw CocoaError(.fileWriteNoPermission)
+                    }
+                    try data.write(to: url, options: [.atomic])
+                },
+                removeItem: { try FileManager.default.removeItem(at: $0) }
+            )
+        )
+        let newerConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Local",
+            remoteText: "Remote 2",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 300),
+            expiresAt: Date().addingTimeInterval(1_000)
+        )
+
+        XCTAssertThrowsError(try failingStore.commitChecked(SyncTextConflictCommitEffects(
+            preservedConflicts: [newerConflict]
+        )))
+        XCTAssertNil(conflictStore.queuedConflict(entityType: .item, entityID: "item-1", fieldID: "text"))
+    }
+
+    func testCheckedConflictCommitThrowsWhenResolvedConflictWriteFails() {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        let directoryURL = conflictURL.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let conflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Local",
+            remoteText: "Remote",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            expiresAt: Date().addingTimeInterval(1_000)
+        )
+        _ = conflictStore.preserve(conflict)
+        let failingStore = SyncTextConflictStore(
+            fileURL: conflictURL,
+            fileIO: SyncTextConflictStore.FileIO(
+                fileExists: { FileManager.default.fileExists(atPath: $0) },
+                readData: { try Data(contentsOf: $0) },
+                createDirectory: {
+                    try FileManager.default.createDirectory(at: $0, withIntermediateDirectories: true)
+                },
+                writeData: { data, url in
+                    if url.lastPathComponent == "sync-resolved-conflicts.json" {
+                        throw CocoaError(.fileWriteNoPermission)
+                    }
+                    try data.write(to: url, options: [.atomic])
+                },
+                removeItem: { try FileManager.default.removeItem(at: $0) }
+            )
+        )
+
+        XCTAssertThrowsError(try failingStore.commitChecked(SyncTextConflictCommitEffects(
+            removedResolvedConflicts: [conflict]
+        )))
+    }
+
+    func testCheckedConflictCommitQueuesSameFieldConflictWithoutDroppingActiveConflict() throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let activeConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Local",
+            remoteText: "Remote 1",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            expiresAt: Date().addingTimeInterval(1_000)
+        )
+        let newerConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Local",
+            remoteText: "Remote 2",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 300),
+            expiresAt: Date().addingTimeInterval(1_000)
+        )
+
+        try conflictStore.commitChecked(SyncTextConflictCommitEffects(preservedConflicts: [activeConflict]))
+        try conflictStore.commitChecked(SyncTextConflictCommitEffects(preservedConflicts: [newerConflict]))
+
+        XCTAssertEqual(conflictStore.activeConflicts().map(\.id), [activeConflict.id])
+        XCTAssertEqual(
+            conflictStore.queuedConflict(entityType: .item, entityID: "item-1", fieldID: "text")?.conflict.id,
+            newerConflict.id
+        )
+    }
+
+    func testPreserveExactRemoteConflictTwiceDoesNotQueueDuplicate() {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let activeConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Local 1",
+            remoteText: "Remote",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            preservedAt: Date(timeIntervalSince1970: 300),
+            expiresAt: Date().addingTimeInterval(1_000)
+        )
+        let redeliveredConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Local 2",
+            remoteText: "Remote",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            preservedAt: Date(timeIntervalSince1970: 400),
+            expiresAt: Date().addingTimeInterval(1_000)
+        )
+
+        _ = conflictStore.preserve(activeConflict)
+        _ = conflictStore.preserve(redeliveredConflict)
+
+        XCTAssertEqual(conflictStore.activeConflicts().map(\.id), [activeConflict.id])
+        XCTAssertNil(conflictStore.queuedConflict(entityType: .item, entityID: "item-1", fieldID: "text"))
+    }
+
+    func testCheckedCommitExactRemoteConflictTwiceDoesNotQueueDuplicate() throws {
+        let conflictURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("sync-conflicts.json")
+        defer { try? FileManager.default.removeItem(at: conflictURL.deletingLastPathComponent()) }
+        let conflictStore = SyncTextConflictStore(fileURL: conflictURL)
+        let activeConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Local 1",
+            remoteText: "Remote",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            preservedAt: Date(timeIntervalSince1970: 300),
+            expiresAt: Date().addingTimeInterval(1_000)
+        )
+        let redeliveredConflict = SyncTextConflictVersion(
+            entityType: .item,
+            entityID: "item-1",
+            fieldID: "text",
+            localText: "Local 2",
+            remoteText: "Remote",
+            remoteUpdatedAt: Date(timeIntervalSince1970: 200),
+            preservedAt: Date(timeIntervalSince1970: 400),
+            expiresAt: Date().addingTimeInterval(1_000)
+        )
+
+        try conflictStore.commitChecked(SyncTextConflictCommitEffects(preservedConflicts: [activeConflict]))
+        try conflictStore.commitChecked(SyncTextConflictCommitEffects(preservedConflicts: [redeliveredConflict]))
+
+        XCTAssertEqual(conflictStore.activeConflicts().map(\.id), [activeConflict.id])
+        XCTAssertNil(conflictStore.queuedConflict(entityType: .item, entityID: "item-1", fieldID: "text"))
     }
 
     func testRemovingResolvedConflictClearsDuplicateEntityFieldConflicts() {
@@ -1743,6 +2149,306 @@ final class NearbySyncCoreTests: XCTestCase {
 
         XCTAssertEqual(envelope.changes.count, 1)
         XCTAssertEqual(envelope.changes.first?.payload, Data("payload-100".utf8))
+    }
+
+    // MARK: - Two-phase legacy receive (prepare / commit)
+
+    func testPrepareIncomingEnvelopeDoesNotMarkCandidateHandled() async throws {
+        let queue = SyncQueue()
+        let engine = SyncEngine(deviceID: "device-b", store: InMemorySyncStore(), queue: queue)
+        let change = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: Data("payload".utf8),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            originDeviceID: "device-a"
+        )
+        let envelope = SyncEnvelope(senderDeviceID: "device-a", changes: [change])
+
+        let preparation = await engine.prepareIncomingEnvelope(envelope)
+
+        XCTAssertEqual(preparation.candidateChanges, [change])
+        XCTAssertTrue(preparation.alreadyHandledChangeIDs.isEmpty)
+        let hasApplied = await queue.hasApplied(change.id)
+        XCTAssertFalse(hasApplied)
+        let pendingAcknowledgementIDs = await queue.acknowledgementBatch()
+        XCTAssertFalse(pendingAcknowledgementIDs.contains(change.id))
+    }
+
+    func testStrictCommitPersistsHandledStateAcrossRestart() async throws {
+        let fileURL = temporaryQueueURL()
+        defer { try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent()) }
+        let change = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: Data("payload".utf8),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            originDeviceID: "device-a"
+        )
+        let firstEngine = SyncEngine(
+            deviceID: "device-b",
+            store: InMemorySyncStore(),
+            queue: SyncQueue(persistence: FileBackedSyncQueuePersistence(fileURL: fileURL))
+        )
+        let firstPreparation = await firstEngine.prepareIncomingEnvelope(
+            SyncEnvelope(senderDeviceID: "device-a", changes: [change])
+        )
+        try await firstEngine.commitHandledIncomingChanges(Set(firstPreparation.candidateChanges.map(\.id)))
+
+        let restartedEngine = SyncEngine(
+            deviceID: "device-b",
+            store: InMemorySyncStore(),
+            queue: SyncQueue(persistence: FileBackedSyncQueuePersistence(fileURL: fileURL))
+        )
+        let secondPreparation = await restartedEngine.prepareIncomingEnvelope(
+            SyncEnvelope(senderDeviceID: "device-a", changes: [change])
+        )
+
+        XCTAssertTrue(secondPreparation.candidateChanges.isEmpty)
+        XCTAssertEqual(secondPreparation.alreadyHandledChangeIDs, [change.id])
+    }
+
+    func testStrictCommitFailureRollsBackAndThrows() async throws {
+        let queue = SyncQueue(
+            persistence: FailingSyncQueuePersistence(
+                loadResult: SyncQueuePersistenceLoadResult(snapshot: SyncQueueSnapshot(), health: .healthy)
+            )
+        )
+        let engine = SyncEngine(deviceID: "device-b", store: InMemorySyncStore(), queue: queue)
+        let change = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: Data("payload".utf8),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            originDeviceID: "device-a"
+        )
+        let preparation = await engine.prepareIncomingEnvelope(
+            SyncEnvelope(senderDeviceID: "device-a", changes: [change])
+        )
+
+        do {
+            try await engine.commitHandledIncomingChanges(Set(preparation.candidateChanges.map(\.id)))
+            XCTFail("Expected strict commit to throw")
+        } catch {
+            XCTAssertEqual(error as? SyncHandledStateCommitError, .persistenceFailed)
+        }
+
+        let hasApplied = await queue.hasApplied(change.id)
+        XCTAssertFalse(hasApplied)
+        let pendingAcknowledgementIDs = await queue.acknowledgementBatch()
+        XCTAssertFalse(pendingAcknowledgementIDs.contains(change.id))
+
+        let redeliveredPreparation = await engine.prepareIncomingEnvelope(
+            SyncEnvelope(senderDeviceID: "device-a", changes: [change])
+        )
+        XCTAssertEqual(redeliveredPreparation.candidateChanges, [change])
+    }
+
+    func testCompatibilityWrapperMarksAppliedCandidateTerminal() async throws {
+        let queue = SyncQueue()
+        let engine = SyncEngine(deviceID: "device-b", store: InMemorySyncStore(), queue: queue)
+        let change = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: Data("payload".utf8),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            originDeviceID: "device-a"
+        )
+
+        let result = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-a", changes: [change]))
+
+        XCTAssertEqual(result.appliedChangeIDs, [change.id])
+        let hasApplied = await queue.hasApplied(change.id)
+        XCTAssertTrue(hasApplied)
+        let pendingAcknowledgementIDs = await queue.acknowledgementBatch()
+        XCTAssertTrue(pendingAcknowledgementIDs.contains(change.id))
+
+        let redelivered = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-a", changes: [change]))
+        XCTAssertEqual(redelivered.ignoredDuplicateIDs, [change.id])
+    }
+
+    /// Regression test: the compatibility wrapper must treat a store-rejected
+    /// stale change as terminal, the same as the pre-two-phase implementation.
+    /// Otherwise a deterministically stale change is redelivered forever and
+    /// never classifies as a duplicate.
+    func testCompatibilityWrapperMarksStaleCandidateTerminal() async throws {
+        let queue = SyncQueue()
+        let store = InMemorySyncStore(seedRecords: [
+            SyncRecord(
+                entityType: .item,
+                entityID: "item-1",
+                payload: Data("newer".utf8),
+                updatedAt: Date(timeIntervalSince1970: 200)
+            )
+        ])
+        let engine = SyncEngine(deviceID: "device-b", store: store, queue: queue)
+        let staleChange = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: Data("older".utf8),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            originDeviceID: "device-a"
+        )
+
+        let result = await engine.applyIncomingEnvelope(
+            SyncEnvelope(senderDeviceID: "device-a", changes: [staleChange])
+        )
+
+        XCTAssertEqual(result.ignoredStaleIDs, [staleChange.id])
+        XCTAssertTrue(result.appliedChangeIDs.isEmpty)
+        let hasApplied = await queue.hasApplied(staleChange.id)
+        XCTAssertTrue(
+            hasApplied,
+            "A deterministically stale change must still be committed as handled so it becomes terminal."
+        )
+        let pendingAcknowledgementIDs = await queue.acknowledgementBatch()
+        XCTAssertTrue(pendingAcknowledgementIDs.contains(staleChange.id))
+
+        let redelivered = await engine.applyIncomingEnvelope(
+            SyncEnvelope(senderDeviceID: "device-a", changes: [staleChange])
+        )
+        XCTAssertEqual(redelivered.ignoredDuplicateIDs, [staleChange.id])
+        XCTAssertTrue(
+            redelivered.ignoredStaleIDs.isEmpty,
+            "Redelivery of a terminal stale change must classify as duplicate, not stale again."
+        )
+    }
+
+    func testCompatibilityPersistenceFailureRetainsHandledStateAndDegradesHealth() async throws {
+        let persistence = FailingSyncQueuePersistence(
+            loadResult: SyncQueuePersistenceLoadResult(snapshot: SyncQueueSnapshot(), health: .healthy)
+        )
+        let queue = SyncQueue(persistence: persistence)
+        let engine = SyncEngine(deviceID: "device-b", store: InMemorySyncStore(), queue: queue)
+        let change = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: Data("payload".utf8),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            originDeviceID: "device-a"
+        )
+
+        let result = await engine.applyIncomingEnvelope(SyncEnvelope(senderDeviceID: "device-a", changes: [change]))
+
+        XCTAssertEqual(result.appliedChangeIDs, [change.id])
+        let hasApplied = await queue.hasApplied(change.id)
+        XCTAssertTrue(
+            hasApplied,
+            "Compatibility commit must retain in-memory handled state even when persistence fails"
+        )
+        let pendingAcknowledgementIDs = await queue.acknowledgementBatch()
+        XCTAssertTrue(pendingAcknowledgementIDs.contains(change.id))
+        if case .readFailed = await queue.persistenceHealth() {
+            // Expected.
+        } else {
+            XCTFail("Expected persistence failure to degrade queue health")
+        }
+    }
+
+    func testPrepareIncomingEnvelopeExcludesDurableDuplicateFromCandidates() async throws {
+        let queue = SyncQueue()
+        let engine = SyncEngine(deviceID: "device-b", store: InMemorySyncStore(), queue: queue)
+        let change = SyncChange(
+            entityType: .item,
+            entityID: "item-1",
+            operation: .upsert,
+            payload: Data("payload".utf8),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            originDeviceID: "device-a"
+        )
+        let envelope = SyncEnvelope(senderDeviceID: "device-a", changes: [change])
+        let firstPreparation = await engine.prepareIncomingEnvelope(envelope)
+        try await engine.commitHandledIncomingChanges(Set(firstPreparation.candidateChanges.map(\.id)))
+
+        let secondPreparation = await engine.prepareIncomingEnvelope(envelope)
+
+        XCTAssertEqual(secondPreparation.alreadyHandledChangeIDs, [change.id])
+        XCTAssertTrue(secondPreparation.candidateChanges.isEmpty)
+    }
+
+    func testPrepareIncomingEnvelopeMixedBehaviorPreservesEachCategory() async throws {
+        let queue = SyncQueue()
+        let store = InMemorySyncStore(seedRecords: [
+            SyncRecord(
+                entityType: .item,
+                entityID: "stale-item",
+                payload: Data("newer".utf8),
+                updatedAt: Date(timeIntervalSince1970: 200)
+            )
+        ])
+        let engine = SyncEngine(deviceID: "device-b", store: store, queue: queue)
+
+        let localChange = await engine.recordLocalChange(
+            entityType: .collection,
+            entityID: "collection-1",
+            payload: Data("Inbox".utf8),
+            updatedAt: Date(timeIntervalSince1970: 50)
+        )
+
+        let duplicateChange = SyncChange(
+            entityType: .item,
+            entityID: "item-duplicate",
+            operation: .upsert,
+            payload: Data("payload".utf8),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            originDeviceID: "device-a"
+        )
+        let firstDuplicatePreparation = await engine.prepareIncomingEnvelope(
+            SyncEnvelope(senderDeviceID: "device-a", changes: [duplicateChange])
+        )
+        try await engine.commitHandledIncomingChanges(Set(firstDuplicatePreparation.candidateChanges.map(\.id)))
+
+        let newChange = SyncChange(
+            entityType: .item,
+            entityID: "item-new",
+            operation: .upsert,
+            payload: Data("new".utf8),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            originDeviceID: "device-a"
+        )
+        let staleChange = SyncChange(
+            entityType: .item,
+            entityID: "stale-item",
+            operation: .upsert,
+            payload: Data("older".utf8),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            originDeviceID: "device-a"
+        )
+
+        let mixedEnvelope = SyncEnvelope(
+            senderDeviceID: "device-a",
+            changes: [duplicateChange, newChange, staleChange],
+            acknowledgedChangeIDs: [localChange.id]
+        )
+
+        let preparation = await engine.prepareIncomingEnvelope(mixedEnvelope)
+
+        XCTAssertEqual(preparation.acknowledgedLocalChanges.map(\.id), [localChange.id])
+        XCTAssertEqual(preparation.alreadyHandledChangeIDs, [duplicateChange.id])
+        XCTAssertEqual(Set(preparation.candidateChanges.map(\.id)), [newChange.id, staleChange.id])
+
+        var handledChangeIDs: Set<UUID> = []
+        var appliedChangeIDs: Set<UUID> = []
+        var staleChangeIDs: Set<UUID> = []
+        for change in preparation.candidateChanges {
+            let didApply = await store.apply(change)
+            if didApply {
+                appliedChangeIDs.insert(change.id)
+            } else {
+                staleChangeIDs.insert(change.id)
+            }
+            handledChangeIDs.insert(change.id)
+        }
+        try await engine.commitHandledIncomingChanges(handledChangeIDs)
+
+        XCTAssertEqual(appliedChangeIDs, [newChange.id])
+        XCTAssertEqual(staleChangeIDs, [staleChange.id])
     }
 
     private func temporaryQueueURL() -> URL {

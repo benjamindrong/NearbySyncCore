@@ -143,6 +143,25 @@ public struct SyncApplyResult: Equatable, Sendable {
     }
 }
 
+public struct LegacyIncomingEnvelopePreparation: Equatable, Sendable {
+    public let acknowledgedChangeIDs: [UUID]
+    public let acknowledgedLocalChanges: [SyncChange]
+    public let alreadyHandledChangeIDs: Set<UUID>
+    public let candidateChanges: [SyncChange]
+
+    public init(
+        acknowledgedChangeIDs: [UUID],
+        acknowledgedLocalChanges: [SyncChange],
+        alreadyHandledChangeIDs: Set<UUID>,
+        candidateChanges: [SyncChange]
+    ) {
+        self.acknowledgedChangeIDs = acknowledgedChangeIDs
+        self.acknowledgedLocalChanges = acknowledgedLocalChanges
+        self.alreadyHandledChangeIDs = alreadyHandledChangeIDs
+        self.candidateChanges = candidateChanges
+    }
+}
+
 public enum SyncTextConflictAction: String, Codable, Sendable {
     case preserved
     case resolved
@@ -732,13 +751,70 @@ public struct SyncTextQueuedConflict: Codable, Equatable, Sendable {
     }
 }
 
+public struct SyncTextConflictCommitEffects: Sendable, Equatable {
+    public let preservedConflicts: [SyncTextConflictVersion]
+    public let removedConflictIDs: [UUID]
+    public let removedResolvedConflicts: [SyncTextConflictVersion]
+
+    public init(
+        preservedConflicts: [SyncTextConflictVersion] = [],
+        removedConflictIDs: [UUID] = [],
+        removedResolvedConflicts: [SyncTextConflictVersion] = []
+    ) {
+        self.preservedConflicts = preservedConflicts
+        self.removedConflictIDs = removedConflictIDs
+        self.removedResolvedConflicts = removedResolvedConflicts
+    }
+}
+
 public final class SyncTextConflictStore: @unchecked Sendable {
+    public struct FileIO: Sendable {
+        var fileExists: @Sendable (String) -> Bool
+        var readData: @Sendable (URL) throws -> Data
+        var createDirectory: @Sendable (URL) throws -> Void
+        var writeData: @Sendable (Data, URL) throws -> Void
+        var removeItem: @Sendable (URL) throws -> Void
+
+        public init(
+            fileExists: @escaping @Sendable (String) -> Bool,
+            readData: @escaping @Sendable (URL) throws -> Data,
+            createDirectory: @escaping @Sendable (URL) throws -> Void,
+            writeData: @escaping @Sendable (Data, URL) throws -> Void,
+            removeItem: @escaping @Sendable (URL) throws -> Void
+        ) {
+            self.fileExists = fileExists
+            self.readData = readData
+            self.createDirectory = createDirectory
+            self.writeData = writeData
+            self.removeItem = removeItem
+        }
+
+        public static let live = FileIO(
+            fileExists: { FileManager.default.fileExists(atPath: $0) },
+            readData: { try Data(contentsOf: $0) },
+            createDirectory: {
+                try FileManager.default.createDirectory(
+                    at: $0,
+                    withIntermediateDirectories: true
+                )
+            },
+            writeData: { data, url in try data.write(to: url, options: [.atomic]) },
+            removeItem: { try FileManager.default.removeItem(at: $0) }
+        )
+    }
+
     private let fileURL: URL
+    private let fileIO: FileIO
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
 
-    public init(fileURL: URL) {
+    public convenience init(fileURL: URL) {
+        self.init(fileURL: fileURL, fileIO: .live)
+    }
+
+    public init(fileURL: URL, fileIO: FileIO) {
         self.fileURL = fileURL
+        self.fileIO = fileIO
     }
 
     public func activeConflicts(now: Date = Date()) -> [SyncTextConflictVersion] {
@@ -757,6 +833,9 @@ public final class SyncTextConflictStore: @unchecked Sendable {
             return activeConflicts()
         }
         let conflicts = activeConflicts()
+        if conflicts.contains(where: { Self.isExactRemoteMatch($0, conflict) }) {
+            return conflicts
+        }
         if conflicts.contains(where: { sameLogicalConflict($0, conflict) }) {
             queue(conflict)
             return conflicts
@@ -768,6 +847,18 @@ public final class SyncTextConflictStore: @unchecked Sendable {
         updatedConflicts.append(conflict)
         _ = saveConflicts(updatedConflicts)
         return activeConflicts()
+    }
+
+    public func commitChecked(_ effects: SyncTextConflictCommitEffects) throws {
+        for conflict in effects.removedResolvedConflicts {
+            try removeResolvedConflictChecked(conflict)
+        }
+        for conflictID in effects.removedConflictIDs {
+            try removeConflictChecked(id: conflictID)
+        }
+        for conflict in effects.preservedConflicts {
+            try preserveChecked(conflict)
+        }
     }
 
     public func hasActiveConflict(entityType: SyncEntityType, entityID: String, fieldID: String, now: Date = Date()) -> Bool {
@@ -822,6 +913,12 @@ public final class SyncTextConflictStore: @unchecked Sendable {
         return (try? decoder.decode([SyncTextConflictVersion].self, from: data)) ?? []
     }
 
+    private func loadConflictsChecked() throws -> [SyncTextConflictVersion] {
+        guard fileIO.fileExists(fileURL.path) else { return [] }
+        let data = try fileIO.readData(fileURL)
+        return try decoder.decode([SyncTextConflictVersion].self, from: data)
+    }
+
     @discardableResult
     public func replaceConflicts(_ conflicts: [SyncTextConflictVersion]) -> SyncPersistenceResult {
         saveConflicts(conflicts)
@@ -835,20 +932,85 @@ public final class SyncTextConflictStore: @unchecked Sendable {
     @discardableResult
     private func saveConflicts(_ conflicts: [SyncTextConflictVersion]) -> SyncPersistenceResult {
         do {
-            try FileManager.default.createDirectory(
-                at: fileURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            let data = try encoder.encode(conflicts)
-            try data.write(to: fileURL, options: [.atomic])
+            try saveConflictsChecked(conflicts)
             return SyncPersistenceResult(didPersist: true)
         } catch {
             return SyncPersistenceResult(didPersist: false, errorDescription: String(describing: error))
         }
     }
 
+    private func saveConflictsChecked(_ conflicts: [SyncTextConflictVersion]) throws {
+        try fileIO.createDirectory(fileURL.deletingLastPathComponent())
+        let data = try encoder.encode(conflicts)
+        try fileIO.writeData(data, fileURL)
+    }
+
+    @discardableResult
+    private func preserveChecked(_ conflict: SyncTextConflictVersion) throws -> [SyncTextConflictVersion] {
+        guard try !isResolvedChecked(conflict) else {
+            return try activeConflictsChecked()
+        }
+        let conflicts = try activeConflictsChecked()
+        if conflicts.contains(where: { Self.isExactRemoteMatch($0, conflict) }) {
+            return conflicts
+        }
+        if conflicts.contains(where: { sameLogicalConflict($0, conflict) }) {
+            try queueChecked(conflict)
+            return conflicts
+        }
+
+        var updatedConflicts = conflicts
+        updatedConflicts.append(conflict)
+        try saveConflictsChecked(updatedConflicts)
+        return try activeConflictsChecked()
+    }
+
+    @discardableResult
+    private func removeConflictChecked(id: UUID) throws -> [SyncTextConflictVersion] {
+        let conflicts = try activeConflictsChecked().filter { $0.id != id }
+        try saveConflictsChecked(conflicts)
+        return conflicts
+    }
+
+    @discardableResult
+    private func removeResolvedConflictChecked(_ conflict: SyncTextConflictVersion) throws -> [SyncTextConflictVersion] {
+        let conflicts = try activeConflictsChecked()
+        let resolvedConflicts = conflicts.filter {
+            sameLogicalConflict($0, conflict) || sameRemoteConflict($0, conflict)
+        }
+        for resolvedConflict in resolvedConflicts {
+            try recordResolvedConflictChecked(resolvedConflict)
+        }
+        if !resolvedConflicts.contains(where: { $0.id == conflict.id }) {
+            try recordResolvedConflictChecked(conflict)
+        }
+        let remainingConflicts = conflicts.filter {
+            !sameLogicalConflict($0, conflict) && !sameRemoteConflict($0, conflict)
+        }
+        try saveConflictsChecked(remainingConflicts)
+        try removeQueuedConflictChecked(matching: conflict)
+        return remainingConflicts
+    }
+
+    private func activeConflictsChecked(now: Date = Date()) throws -> [SyncTextConflictVersion] {
+        let active = try loadConflictsChecked().filter { $0.expiresAt > now }
+        try saveConflictsChecked(active)
+        return active.sorted {
+            if $0.preservedAt == $1.preservedAt {
+                return $0.id.uuidString < $1.id.uuidString
+            }
+            return $0.preservedAt > $1.preservedAt
+        }
+    }
+
     private func isResolved(_ conflict: SyncTextConflictVersion, now: Date = Date()) -> Bool {
         loadResolvedConflicts(now: now).contains {
+            sameRemoteConflict($0, conflict)
+        }
+    }
+
+    private func isResolvedChecked(_ conflict: SyncTextConflictVersion, now: Date = Date()) throws -> Bool {
+        try loadResolvedConflictsChecked(now: now).contains {
             sameRemoteConflict($0, conflict)
         }
     }
@@ -874,6 +1036,27 @@ public final class SyncTextConflictStore: @unchecked Sendable {
         _ = saveResolvedConflicts(resolvedConflicts)
     }
 
+    private func recordResolvedConflictChecked(_ conflict: SyncTextConflictVersion, now: Date = Date()) throws {
+        var resolvedConflicts = try loadResolvedConflictsChecked(now: now)
+        let resolvedConflict = SyncTextResolvedConflict(
+            entityType: conflict.entityType,
+            entityID: conflict.entityID,
+            fieldID: conflict.fieldID,
+            localText: conflict.localText,
+            remoteText: conflict.remoteText,
+            remoteData: conflict.remoteData,
+            remoteUpdatedAt: conflict.remoteUpdatedAt,
+            resolvedAt: now,
+            expiresAt: now.addingTimeInterval(SyncTextConflictPolicy.retention)
+        )
+        if let index = resolvedConflicts.firstIndex(where: { sameRemoteConflict($0, conflict) }) {
+            resolvedConflicts[index] = resolvedConflict
+        } else {
+            resolvedConflicts.append(resolvedConflict)
+        }
+        try saveResolvedConflictsChecked(resolvedConflicts)
+    }
+
     private func loadResolvedConflicts(now: Date = Date()) -> [SyncTextResolvedConflict] {
         guard let data = try? Data(contentsOf: resolvedFileURL) else { return [] }
         let resolvedConflicts = ((try? decoder.decode([SyncTextResolvedConflict].self, from: data)) ?? [])
@@ -882,28 +1065,45 @@ public final class SyncTextConflictStore: @unchecked Sendable {
         return resolvedConflicts
     }
 
+    private func loadResolvedConflictsChecked(now: Date = Date()) throws -> [SyncTextResolvedConflict] {
+        guard fileIO.fileExists(resolvedFileURL.path) else { return [] }
+        let data = try fileIO.readData(resolvedFileURL)
+        let resolvedConflicts = try decoder.decode([SyncTextResolvedConflict].self, from: data)
+            .filter { $0.expiresAt > now }
+        try saveResolvedConflictsChecked(resolvedConflicts)
+        return resolvedConflicts
+    }
+
     @discardableResult
     private func saveResolvedConflicts(_ resolvedConflicts: [SyncTextResolvedConflict]) -> SyncPersistenceResult {
         do {
-            try FileManager.default.createDirectory(
-                at: resolvedFileURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            let data = try encoder.encode(resolvedConflicts)
-            try data.write(to: resolvedFileURL, options: [.atomic])
+            try saveResolvedConflictsChecked(resolvedConflicts)
             return SyncPersistenceResult(didPersist: true)
         } catch {
             return SyncPersistenceResult(didPersist: false, errorDescription: String(describing: error))
         }
     }
 
-    private func sameRemoteConflict(_ lhs: SyncTextConflictVersion, _ rhs: SyncTextConflictVersion) -> Bool {
+    private func saveResolvedConflictsChecked(_ resolvedConflicts: [SyncTextResolvedConflict]) throws {
+        try fileIO.createDirectory(resolvedFileURL.deletingLastPathComponent())
+        let data = try encoder.encode(resolvedConflicts)
+        try fileIO.writeData(data, resolvedFileURL)
+    }
+
+    public static func isExactRemoteMatch(
+        _ lhs: SyncTextConflictVersion,
+        _ rhs: SyncTextConflictVersion
+    ) -> Bool {
         lhs.entityType == rhs.entityType
             && lhs.entityID == rhs.entityID
             && lhs.fieldID == rhs.fieldID
             && lhs.remoteUpdatedAt == rhs.remoteUpdatedAt
             && lhs.remoteText == rhs.remoteText
             && lhs.remoteData == rhs.remoteData
+    }
+
+    private func sameRemoteConflict(_ lhs: SyncTextConflictVersion, _ rhs: SyncTextConflictVersion) -> Bool {
+        Self.isExactRemoteMatch(lhs, rhs)
     }
 
     private func sameLogicalConflict(_ lhs: SyncTextConflictVersion, _ rhs: SyncTextConflictVersion) -> Bool {
@@ -932,6 +1132,13 @@ public final class SyncTextConflictStore: @unchecked Sendable {
         _ = saveQueuedConflicts(queuedConflicts)
     }
 
+    private func queueChecked(_ conflict: SyncTextConflictVersion, queuedAt: Date = Date()) throws {
+        var queuedConflicts = try loadQueuedConflictsChecked()
+        queuedConflicts.removeAll { sameLogicalConflict($0.conflict, conflict) }
+        queuedConflicts.append(SyncTextQueuedConflict(conflict: conflict, queuedAt: queuedAt))
+        try saveQueuedConflictsChecked(queuedConflicts)
+    }
+
     private func removeQueuedConflict(matching conflict: SyncTextConflictVersion) {
         let queuedConflicts = loadQueuedConflicts().filter {
             !sameLogicalConflict($0.conflict, conflict)
@@ -939,24 +1146,38 @@ public final class SyncTextConflictStore: @unchecked Sendable {
         _ = saveQueuedConflicts(queuedConflicts)
     }
 
+    private func removeQueuedConflictChecked(matching conflict: SyncTextConflictVersion) throws {
+        let queuedConflicts = try loadQueuedConflictsChecked().filter {
+            !sameLogicalConflict($0.conflict, conflict)
+        }
+        try saveQueuedConflictsChecked(queuedConflicts)
+    }
+
     private func loadQueuedConflicts() -> [SyncTextQueuedConflict] {
         guard let data = try? Data(contentsOf: queuedFileURL) else { return [] }
         return (try? decoder.decode([SyncTextQueuedConflict].self, from: data)) ?? []
     }
 
+    private func loadQueuedConflictsChecked() throws -> [SyncTextQueuedConflict] {
+        guard fileIO.fileExists(queuedFileURL.path) else { return [] }
+        let data = try fileIO.readData(queuedFileURL)
+        return try decoder.decode([SyncTextQueuedConflict].self, from: data)
+    }
+
     @discardableResult
     private func saveQueuedConflicts(_ queuedConflicts: [SyncTextQueuedConflict]) -> SyncPersistenceResult {
         do {
-            try FileManager.default.createDirectory(
-                at: queuedFileURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            let data = try encoder.encode(queuedConflicts)
-            try data.write(to: queuedFileURL, options: [.atomic])
+            try saveQueuedConflictsChecked(queuedConflicts)
             return SyncPersistenceResult(didPersist: true)
         } catch {
             return SyncPersistenceResult(didPersist: false, errorDescription: String(describing: error))
         }
+    }
+
+    private func saveQueuedConflictsChecked(_ queuedConflicts: [SyncTextQueuedConflict]) throws {
+        try fileIO.createDirectory(queuedFileURL.deletingLastPathComponent())
+        let data = try encoder.encode(queuedConflicts)
+        try fileIO.writeData(data, queuedFileURL)
     }
 
     private var resolvedFileURL: URL {
@@ -968,4 +1189,67 @@ public final class SyncTextConflictStore: @unchecked Sendable {
         fileURL.deletingLastPathComponent()
             .appendingPathComponent("sync-queued-conflicts.json")
     }
+
+    /// Captures the exact on-disk bytes backing active, resolved, and queued
+    /// conflict state. Intended for callers that must speculatively apply an
+    /// incoming change (which may write conflict metadata as a side effect)
+    /// and roll back that write if a separate, later persistence step fails.
+    public func snapshot() throws -> SyncTextConflictStoreSnapshot {
+        SyncTextConflictStoreSnapshot(
+            conflicts: try snapshotState(for: fileURL),
+            resolved: try snapshotState(for: resolvedFileURL),
+            queued: try snapshotState(for: queuedFileURL)
+        )
+    }
+
+    /// Restores exactly the on-disk bytes captured by `snapshot()`, including
+    /// removing a file that did not exist at snapshot time.
+    public func restore(_ snapshot: SyncTextConflictStoreSnapshot) throws {
+        try restore(snapshot.conflicts, to: fileURL)
+        try restore(snapshot.resolved, to: resolvedFileURL)
+        try restore(snapshot.queued, to: queuedFileURL)
+    }
+
+    private func snapshotState(for url: URL) throws -> SyncFileSnapshotState {
+        guard fileIO.fileExists(url.path) else {
+            return .absent
+        }
+        do {
+            return .present(try fileIO.readData(url))
+        } catch {
+            throw SyncTextConflictStoreSnapshotError.captureFailed(path: url.path)
+        }
+    }
+
+    private func restore(_ state: SyncFileSnapshotState, to url: URL) throws {
+        do {
+            switch state {
+            case .absent:
+                if fileIO.fileExists(url.path) {
+                    try fileIO.removeItem(url)
+                }
+            case .present(let data):
+                try fileIO.createDirectory(url.deletingLastPathComponent())
+                try fileIO.writeData(data, url)
+            }
+        } catch {
+            throw SyncTextConflictStoreSnapshotError.restoreFailed(path: url.path)
+        }
+    }
+}
+
+public enum SyncFileSnapshotState: Sendable, Equatable {
+    case absent
+    case present(Data)
+}
+
+public enum SyncTextConflictStoreSnapshotError: Error, Equatable {
+    case captureFailed(path: String)
+    case restoreFailed(path: String)
+}
+
+public struct SyncTextConflictStoreSnapshot: Sendable, Equatable {
+    public let conflicts: SyncFileSnapshotState
+    public let resolved: SyncFileSnapshotState
+    public let queued: SyncFileSnapshotState
 }
