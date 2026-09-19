@@ -134,12 +134,14 @@ final class MYR223QueueOwnershipTests: XCTestCase {
         XCTAssertTrue(predecessorAdmitted)
         XCTAssertTrue(successorAdmitted)
 
-        let firstEnvelope = try XCTUnwrap(await engine.nextEnvelope())
+        let firstOptionalEnvelope = await engine.nextEnvelope()
+        let firstEnvelope = try XCTUnwrap(firstOptionalEnvelope)
         XCTAssertEqual(firstEnvelope.changes, [predecessor])
 
         _ = await engine.acknowledgeChanges([predecessor.id])
 
-        let secondEnvelope = try XCTUnwrap(await engine.nextEnvelope())
+        let secondOptionalEnvelope = await engine.nextEnvelope()
+        let secondEnvelope = try XCTUnwrap(secondOptionalEnvelope)
         XCTAssertEqual(secondEnvelope.changes, [successor])
     }
 
@@ -181,12 +183,11 @@ final class MYR223QueueOwnershipTests: XCTestCase {
             UUID(uuidString: "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC")!
         ])
 
-        let envelope = try XCTUnwrap(
-            await engine.nextEnvelope(
-                limit: 1,
-                excludingTargets: [SyncTarget(entityType: .item, entityID: "note-1")]
-            )
+        let optionalEnvelope = await engine.nextEnvelope(
+            limit: 1,
+            excludingTargets: [SyncTarget(entityType: .item, entityID: "note-1")]
         )
+        let envelope = try XCTUnwrap(optionalEnvelope)
 
         XCTAssertEqual(envelope.changes, [unrelated])
         XCTAssertEqual(envelope.acknowledgedChangeIDs.count, 1)
