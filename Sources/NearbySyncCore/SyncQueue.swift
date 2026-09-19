@@ -41,8 +41,108 @@ public actor SyncQueue {
         }
     }
 
-    public func pendingBatch(limit: Int = 100) -> [SyncChange] {
-        Array(pendingChanges.prefix(limit))
+    public func enqueueSuccessor(
+        _ change: SyncChange,
+        preserving predecessorID: UUID
+    ) throws {
+        let matchingPredecessorIndices = pendingChanges.indices.filter {
+            pendingChanges[$0].id == predecessorID
+        }
+        guard matchingPredecessorIndices.count == 1,
+              let predecessorIndex = matchingPredecessorIndices.first else {
+            throw SyncQueueProtectedSuccessorError.predecessorMissingOrDuplicated
+        }
+
+        let predecessor = pendingChanges[predecessorIndex]
+        guard predecessor.syncTarget == change.syncTarget else {
+            throw SyncQueueProtectedSuccessorError.targetMismatch
+        }
+
+        let sameTargetIndices = pendingChanges.indices.filter {
+            pendingChanges[$0].syncTarget == change.syncTarget
+        }
+        let successorIndices = sameTargetIndices.filter { $0 != predecessorIndex }
+        guard successorIndices.count <= 1,
+              successorIndices.allSatisfy({ $0 > predecessorIndex }) else {
+            throw SyncQueueProtectedSuccessorError.invalidExistingTargetState
+        }
+
+        let previousPendingChanges = pendingChanges
+        if let successorIndex = successorIndices.first {
+            pendingChanges[successorIndex] = change
+        } else {
+            pendingChanges.insert(change, at: predecessorIndex + 1)
+        }
+
+        let result = persistPendingChanges()
+        guard result.didPersist else {
+            pendingChanges = previousPendingChanges
+            throw SyncQueueProtectedSuccessorError.persistenceFailed
+        }
+    }
+
+    public func reorderPendingChanges(withIDsInOrder changeIDs: [UUID]) throws {
+        guard Set(changeIDs).count == changeIDs.count else {
+            throw SyncQueuePendingOrderError.duplicateRequestedChangeID
+        }
+        guard !changeIDs.isEmpty else { return }
+
+        let selectedIDs = Set(changeIDs)
+        let selectedEntries = pendingChanges.enumerated().filter {
+            selectedIDs.contains($0.element.id)
+        }
+        guard selectedEntries.count == changeIDs.count else {
+            throw SyncQueuePendingOrderError.missingRequestedChangeID
+        }
+
+        let entryByID = Dictionary(uniqueKeysWithValues: selectedEntries.map { ($0.element.id, $0.element) })
+        guard entryByID.count == changeIDs.count else {
+            throw SyncQueuePendingOrderError.duplicatePendingChangeID
+        }
+        let orderedSelected = changeIDs.compactMap { entryByID[$0] }
+        guard orderedSelected.count == changeIDs.count,
+              let earliestSelectedIndex = selectedEntries.map(\.offset).min() else {
+            throw SyncQueuePendingOrderError.missingRequestedChangeID
+        }
+
+        let insertionIndex = pendingChanges[..<earliestSelectedIndex].filter {
+            !selectedIDs.contains($0.id)
+        }.count
+        var reordered = pendingChanges.filter { !selectedIDs.contains($0.id) }
+        reordered.insert(contentsOf: orderedSelected, at: insertionIndex)
+
+        guard reordered != pendingChanges else { return }
+
+        let previousPendingChanges = pendingChanges
+        pendingChanges = reordered
+        let result = persistPendingChanges()
+        guard result.didPersist else {
+            pendingChanges = previousPendingChanges
+            throw SyncQueuePendingOrderError.persistenceFailed
+        }
+    }
+
+    public func pendingBatch(
+        limit: Int = 100,
+        excludingTargets: Set<SyncTarget> = []
+    ) -> [SyncChange] {
+        guard limit > 0 else { return [] }
+
+        var result: [SyncChange] = []
+        var seenTargets: Set<SyncTarget> = []
+
+        for change in pendingChanges {
+            let target = change.syncTarget
+            guard seenTargets.insert(target).inserted else { continue }
+            guard !excludingTargets.contains(target) else { continue }
+
+            result.append(change)
+            if result.count == limit {
+                break
+            }
+        }
+
+        return result
     }
 
     public func pendingChanges(withIDs changeIDs: [UUID]) -> [SyncChange] {
@@ -90,12 +190,12 @@ public actor SyncQueue {
         }
     }
 
-    /// Compatibility best-effort commit for `applyIncomingEnvelope(_:)` and
+    /// Compatibility best-effort commit for `applyIncomingEnvelope(_:)\` and
     /// other legacy consumers that do not observe a thrown error. Unlike
-    /// `commitAppliedChangeIDs(_:)`, in-memory handled/pending-acknowledgement
+    /// `commitAppliedChangeIDs(_:)\`, in-memory handled/pending-acknowledgement
     /// state is retained even when persistence fails, matching the previous
-    /// `markApplied(_:)` behavior. Persistence failure is surfaced only
-    /// through `persistenceHealth()`.
+    /// `markApplied(_:)\` behavior. Persistence failure is surfaced only
+    /// through `persistenceHealth()\`.
     public func commitAppliedChangeIDsBestEffort(_ changeIDs: [UUID]) {
         appliedChangeIDs.formUnion(changeIDs)
         pendingAcknowledgementIDs.formUnion(changeIDs)
@@ -201,7 +301,21 @@ public enum SyncQueueReplacementError: Error, Equatable {
     case unhealthyPersistence
 }
 
-/// Thrown by the strict `commitAppliedChangeIDs(_:)` two-phase commit when
+public enum SyncQueuePendingOrderError: Error, Equatable {
+    case duplicateRequestedChangeID
+    case missingRequestedChangeID
+    case duplicatePendingChangeID
+    case persistenceFailed
+}
+
+public enum SyncQueueProtectedSuccessorError: Error, Equatable {
+    case predecessorMissingOrDuplicated
+    case targetMismatch
+    case invalidExistingTargetState
+    case persistenceFailed
+}
+
+/// Thrown by the strict `commitAppliedChangeIDs(_:)\` two-phase commit when
 /// handled/pending-acknowledgement state cannot be durably persisted.
 public enum SyncHandledStateCommitError: Error, Equatable {
     case persistenceFailed
@@ -279,13 +393,18 @@ public final class FileBackedSyncQueuePersistence: SyncQueuePersistence, @unchec
     }
 }
 
+public struct SyncTarget: Hashable, Sendable {
+    public let entityType: SyncEntityType
+    public let entityID: String
+
+    public init(entityType: SyncEntityType, entityID: String) {
+        self.entityType = entityType
+        self.entityID = entityID
+    }
+}
+
 private extension SyncChange {
     var syncTarget: SyncTarget {
         SyncTarget(entityType: entityType, entityID: entityID)
     }
-}
-
-private struct SyncTarget: Hashable {
-    let entityType: SyncEntityType
-    let entityID: String
 }
