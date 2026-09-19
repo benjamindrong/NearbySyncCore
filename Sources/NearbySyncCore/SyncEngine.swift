@@ -34,8 +34,51 @@ public final class SyncEngine: @unchecked Sendable {
         return change
     }
 
-    public func nextEnvelope(limit: Int = 100) async -> SyncEnvelope? {
-        let changes = await queue.pendingBatch(limit: limit)
+    @discardableResult
+    public func recordLocalChange(_ change: SyncChange) async -> Bool {
+        guard change.originDeviceID == deviceID else {
+            return false
+        }
+
+        let didApply = await store.apply(change)
+        guard didApply else {
+            return false
+        }
+
+        await queue.enqueue(change)
+        return true
+    }
+
+    @discardableResult
+    public func recordLocalSuccessorChange(
+        _ change: SyncChange,
+        preserving predecessorID: UUID
+    ) async throws -> Bool {
+        guard change.originDeviceID == deviceID else {
+            return false
+        }
+
+        let didApply = await store.apply(change)
+        guard didApply else {
+            return false
+        }
+
+        try await queue.enqueueSuccessor(change, preserving: predecessorID)
+        return true
+    }
+
+    public func reorderPendingChanges(withIDsInOrder changeIDs: [UUID]) async throws {
+        try await queue.reorderPendingChanges(withIDsInOrder: changeIDs)
+    }
+
+    public func nextEnvelope(
+        limit: Int = 100,
+        excludingTargets: Set<SyncTarget> = []
+    ) async -> SyncEnvelope? {
+        let changes = await queue.pendingBatch(
+            limit: limit,
+            excludingTargets: excludingTargets
+        )
         let acknowledgements = await queue.acknowledgementBatch(limit: limit)
         guard !changes.isEmpty || !acknowledgements.isEmpty else { return nil }
         // Envelopes may carry content, acknowledgements, or both. This keeps the
